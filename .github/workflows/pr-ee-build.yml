@@ -5,6 +5,7 @@ on:
     branches:
       - main
     types: [opened, reopened, synchronize]
+  workflow_dispatch:  
 
 jobs:
   prepare-matrix:
@@ -18,7 +19,8 @@ jobs:
       with:
         repository: ${{ github.event.pull_request.head.repo.full_name }}
         fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.ref != '' && github.event.pull_request.head.ref || 'main' }}
+        ref: ${{ github.event.pull_request.head.sha }} # exact commit
+        #ref: ${{ github.event.pull_request.head.ref != '' && github.event.pull_request.head.ref || 'main' }}
 
     - name: Generate matrix  
       id: generate-matrix
@@ -48,6 +50,13 @@ jobs:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
       fail-fast: false
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref != '' && github.event.pull_request.head.ref || 'main' }}
+
       - name: Print working directory
         run: pwd
 
@@ -115,7 +124,7 @@ jobs:
 
       - name: Substitute token for automation hub
         run: |
-          sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
+          sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/g" ansible.cfg
 
       - name: Build image and create artifact
         working-directory: ${{ matrix.ee }}
