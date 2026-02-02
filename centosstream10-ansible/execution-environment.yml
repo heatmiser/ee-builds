@@ -5,17 +5,17 @@ images:
     name: 'quay.io/centos/centos:stream10'
 
 dependencies:
-  galaxy: requirements.yml
-  python: requirements.txt
+  galaxy: files/requirements.yml
+  python: files/requirements.txt
   ansible_core:
     package_pip: ansible-core==2.16.16
   ansible_runner:
     # renovate: depName=ansible-runner datasource=pypi
     package_pip: ansible-runner
-  system: bindep.txt
+  system: files/bindep.txt
 
 additional_build_files:
-  - src: customize.sh
+  - src: files/customize.sh
     dest: scripts
 
 options:
