@@ -13,10 +13,10 @@ collections:
   - name: containers.podman
     version: 1.18.0
   # windows
-  - name: chocolatey.chocolatey
-  - name: community.windows
+  # - name: chocolatey.chocolatey
+  # - name: community.windows
   # cloud
-  - name: azure.azcollection
-  - name: amazon.aws
-    version: 10.1.2
+  # - name: azure.azcollection
+  # - name: amazon.aws
+  #   version: 10.1.2
 ...
