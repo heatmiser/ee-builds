@@ -4,7 +4,7 @@ collections:
   - name: ansible.utils
     version: 6.0.0
   # ansible controller
-  - name: infra.controller_configuration
+  # - name: infra.controller_configuration
   # linux
   - name: ansible.posix
     version: 2.1.0
