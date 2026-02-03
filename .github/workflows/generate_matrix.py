@@ -42,7 +42,8 @@ def parse_arguments():
     return parser.parse_args()
 
 def main():
-    """Main function to generate a matrix based on changed directories containing 'execution-environment.yml'."""
+    """Main function to generate a matrix based on directories containing any changed TARGET_FILES."""
+    TARGET_FILES = ["execution-environment.yml", "requirements.txt", "requirements.yml", "bindep.txt", "customize.sh"]
     args = parse_arguments()
     log_level = logging.DEBUG if args.log_level == 'DEBUG' else logging.INFO
     logger = setup_logger(log_level)
@@ -61,11 +62,23 @@ def main():
     dirs = set()
 
     for file in changed_files:
-        dir_name = os.path.dirname(file)
-        ee_file_path = os.path.join(os.getenv('GITHUB_WORKSPACE', ''), dir_name, "execution-environment.yml")
-        if dir_name not in dirs and os.path.isfile(ee_file_path):
-            logger.info(f"EE file found: {ee_file_path}")
-            dirs.add(dir_name)
+        current_dir = os.path.dirname(file)
+        workspace = os.getenv('GITHUB_WORKSPACE', '')
+
+        # Walk up the directory tree
+        while current_dir != "":
+            # Check for any of our trigger files in the current level
+            if any(os.path.isfile(os.path.join(workspace, current_dir, t)) for t in TARGET_FILES):
+                if current_dir not in dirs:
+                    logger.info(f"Found build context at: {current_dir}")
+                    # only need the first directory no matter how deep in the path the modified file is found
+                    dirs.add(current_dir.split(os.sep)[0])
+                break # Found the context for this file, stop climbing
+            
+            # Move to parent
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir: break
+            current_dir = parent
 
     matrix = {'include': [{'ee': dir_name} for dir_name in dirs]}
     logger.info(f"Generated matrix: {json.dumps(matrix, indent=4)}")
