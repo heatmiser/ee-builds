@@ -2,13 +2,16 @@
 ## Building execution environment images for use with [Ansible Automation Platform 2](https://www.ansible.com/products/automation-platform)
 ### This repo responds to modifications on `main` and pull requests to main by building new container images with Github Actions to be used as execution environments for Ansible Automation Platform 2.
 
-[![Centos Stream 10 Ansible EE build](https://github.com/heatmiser/ee-builds/actions/workflows/centosstream10-ansible-build.yml/badge.svg)](https://github.com/heatmiser/ee-builds/actions/workflows/centosstream10-ansible-build.yml) [![Windows EE build](https://github.com/heatmiser/ee-builds/actions/workflows/windows-ee-build.yml/badge.svg)](https://github.com/heatmiser/ee-builds/actions/workflows/windows-ee-build.yml) [![f5 EE build](https://github.com/heatmiser/ee-builds/actions/workflows/f5-ee-build.yml/badge.svg)](https://github.com/heatmiser/ee-builds/actions/workflows/f5-ee-build.yml) [![RHEL 90 min EE build](https://github.com/heatmiser/ee-builds/actions/workflows/rhel_90-ee.yml/badge.svg?branch=main)](https://github.com/heatmiser/ee-builds/actions/workflows/rhel_90-ee.yml)
+[Centos Stream 10 Ansible EE PR builds](https://github.com/heatmiser/ee-builds/pkgs/container/centosstream10-ansible)  [RHEL 90 min EE build](https://github.com/heatmiser/ee-builds/actions/workflows/rhel_90-ee.yml)  [Windows EE build](https://github.com/heatmiser/ee-builds/actions/workflows/windows-ee-build.yml)
 
-![workflows](https://github.com/heatmiser/ee-builds/actions)
+[![Devel EE Build](https://github.com/heatmiser/ee-builds/actions/workflows/pr-ee-build.yml/badge.svg?branch=main)](https://github.com/heatmiser/ee-builds/actions/workflows/pr-ee-build.yml)
+[![Prod EE Build](https://github.com/heatmiser/ee-builds/actions/workflows/push-ee-build.yml/badge.svg?branch=main)](https://github.com/heatmiser/ee-builds/actions/workflows/push-ee-build.yml)
+
+[ee-builds GitHub Actions workflows](https://github.com/heatmiser/ee-builds/actions)
 
 
 ### Contributions
-The directories in this repository should follow the format that `ansible-builder` expects. See [centosstream10-ansible](https://github.com/heatmiser/ee-builds/tree/main/centosstream10-ansible) as an example. The name you give the parent directory should also be the name of the image. You can also copy the [centosstream10-ansible workflow](https://github.com/heatmiser/ee-builds/blob/main/.github/workflows/centosstream10-ansible-build.yml) file and adjust the parameters. Questions? Open an issue!
+The directories in this repository should follow the format that `ansible-builder` expects. See [centosstream10-ansible](https://github.com/heatmiser/ee-builds/tree/main/centosstream10-ansible) as an example. The name you give the parent directory will be the name of the resulting image build. For the more advanced users, you can also copy one of the [GitHub  workflows](https://github.com/heatmiser/ee-builds/tree/main/.github/workflows) to a new workflow file and adjust the parameters. Have an idea for a new EE or a process improvement? Submit a PR! Any questions or comments?  Open an issue!
 
 
 ### Useful documentation and links
@@ -22,6 +25,6 @@ The directories in this repository should follow the format that `ansible-builde
 
 ### Open Source
 This project is based on the work of:
-- @cloin and the original [ee-builds](https://github.com/cloin/ee-builds)project. Thank you, Colin!
+- [@cloin](https://www.github.com/cloin) and the original [ee-builds](https://github.com/cloin/ee-builds) project. Thank you, Colin!
 - The Red Hat Ansible TMM [ee-builds](https://github.com/ansible-tmm/ee-builds) project.
-- @ansiblejunky and the [Ansible Execution Environment](https://github.com/ansiblejunky/ansible-execution-environment) project.
+- [@ansiblejunky](https://www.github.com/@ansiblejunky) and the [Ansible Execution Environment](https://github.com/ansiblejunky/ansible-execution-environment) project.
