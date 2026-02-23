@@ -1,5 +1,5 @@
 ---
-version: 1
+version: 3
 
 build_arg_defaults:
   EE_BASE_IMAGE: 'registry.redhat.io/ansible-automation-platform-22/ee-supported-rhel8'
@@ -7,12 +7,12 @@ build_arg_defaults:
 ansible_config: '../ansible.cfg'
 
 dependencies:
-  galaxy: requirements.yml
-  python: requirements.txt
+  galaxy: files/requirements.yml
+  # python: files/requirements.txt
 
 additional_build_steps:
   prepend: |
     RUN pip3 install --upgrade pip setuptools
-  # append: |
-  #   LABEL quay.expires-after="45d"
- 
+    append: |
+      LABEL quay.expires-after="45d"
+...
