@@ -8,7 +8,7 @@ dependencies:
   galaxy: files/requirements.yml
   python: files/requirements.txt
   ansible_core:
-    package_pip: ansible-core==2.16.16
+    package_pip: ansible-core==2.16.18
   ansible_runner:
     # renovate: depName=ansible-runner datasource=pypi
     package_pip: ansible-runner
