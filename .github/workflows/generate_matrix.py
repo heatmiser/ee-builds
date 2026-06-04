@@ -44,6 +44,9 @@ def parse_arguments():
 def main():
     """Main function to generate a matrix based on directories containing any changed TARGET_FILES."""
     TARGET_FILES = ["execution-environment.yml", "requirements.txt", "requirements.yml", "bindep.txt", "customize.sh"]
+    # dcm-ocp-ee-4.x EEs require dcm-base-ee to be published first and are built
+    # by the build-ocp-ees job after build-ee completes. Exclude from this matrix.
+    DEPENDENT_EE_PREFIX = "dcm-ocp-ee-"
     args = parse_arguments()
     log_level = logging.DEBUG if args.log_level == 'DEBUG' else logging.INFO
     logger = setup_logger(log_level)
@@ -80,7 +83,7 @@ def main():
             if parent == current_dir: break
             current_dir = parent
 
-    matrix = {'include': [{'ee': dir_name} for dir_name in dirs]}
+    matrix = {'include': [{'ee': dir_name} for dir_name in dirs if not dir_name.startswith(DEPENDENT_EE_PREFIX)]}
     logger.info(f"Generated matrix: {json.dumps(matrix, indent=4)}")
 
     with open(args.output_path, 'w') as file:

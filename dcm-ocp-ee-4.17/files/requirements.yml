@@ -1,0 +1,5 @@
+---
+# All collections are inherited from dcm-base-ee.
+# No additional collection installs needed in this layer.
+collections: []
+...

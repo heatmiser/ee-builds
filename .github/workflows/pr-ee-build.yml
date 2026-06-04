@@ -186,6 +186,82 @@ jobs:
           echo "Image pushed to repository: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
           echo "> \`podman pull ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
 
+  build-ocp-ees:
+    # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee is available.
+    # Uses the PR-tagged dcm-base-ee image pushed by build-ee as the FROM layer.
+    # Runs always so OCP EE builds are attempted even if unrelated EEs fail.
+    needs: [build-ee]
+    if: always()
+    runs-on: ubuntu-latest
+    environment: test
+    strategy:
+      matrix:
+        ocp_version: ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21']
+      fail-fast: false
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref != '' && github.event.pull_request.head.ref || 'main' }}
+
+      - name: Install python requirements (ansible-builder)
+        run: pip install -r requirements.txt
+
+      - name: Define environment variables
+        run: |
+          echo "EE=dcm-ocp-ee-${{ matrix.ocp_version }}" >> $GITHUB_ENV
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "IMAGE_TAG=pr-${{ github.event.number }}-$SHORT_SHA" >> $GITHUB_ENV
+          echo "BASE_EE_TAG=pr-${{ github.event.number }}-$SHORT_SHA" >> $GITHUB_ENV
+          echo "IMAGE_REGISTRY=ghcr.io" >> $GITHUB_ENV
+
+      - name: Substitute dcm-base-ee reference for PR build
+        # Replace my_quay_username placeholder and :latest tag with the PR-tagged
+        # dcm-base-ee pushed to ghcr.io by build-ee in this same workflow run.
+        run: |
+          sed -i "s|quay.io/my_quay_username/dcm-base-ee:latest|ghcr.io/${{ github.repository_owner }}/dcm-base-ee:${{ env.BASE_EE_TAG }}|g" \
+            dcm-ocp-ee-${{ matrix.ocp_version }}/execution-environment.yml
+
+      - name: Login to ghcr
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.IMAGE_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to registry.redhat.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: registry.redhat.io
+          username: ${{ secrets.REDHAT_SA_USERNAME }}
+          password: ${{ secrets.REDHAT_SA_PASSWORD }}
+
+      - name: Substitute token for automation hub
+        run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/g" ansible.cfg
+
+      - name: Build image
+        working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
+        run: |
+          ansible-builder build -v 3 \
+          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
+          --context=../dcm-ocp-ee-${{ matrix.ocp_version }} \
+          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
+          --tag=${{ env.EE }}:${{ github.sha }}
+
+      - name: Push To GHCR
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ env.EE }}
+          tags: ${{ env.IMAGE_TAG }}
+          registry: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
+
+      - name: Print summary
+        run: |
+          echo "## OCP EE Built" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+
   post-comment:
     needs: build-ee
     runs-on: ubuntu-latest

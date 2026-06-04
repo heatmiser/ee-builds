@@ -1,0 +1,50 @@
+---
+version: 3
+
+images:
+  base_image:
+    name: registry.redhat.io/ansible-automation-platform-26/ee-minimal-rhel9:latest
+
+dependencies:
+  galaxy: files/requirements.yml
+  python: files/requirements.txt
+  system: files/bindep.txt
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_files:
+  # Supply chain enforcement — verify-requirements.py validates ansible-builder's
+  # introspect output against the pre-approved hash manifest before pip runs.
+  - src: files/verify-requirements.py
+    dest: verify
+  - src: files/verified-packages.txt
+    dest: verify
+
+additional_build_steps:
+  prepend_base:
+    - RUN $PYCMD -m pip install --upgrade pip setuptools
+    # EPEL 9 — required for isomd5sum and xorriso (dellemc.openmanage bindep).
+    # Installed in prepend_base so packages reach the final stage (FROM base).
+    - RUN microdnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    - RUN microdnf install -y isomd5sum xorriso
+
+  prepend_galaxy:
+    # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
+    - ARG COLLECTION_TOKEN
+    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+
+  prepend_builder:
+    # Supply chain hook: replace the ansible-builder assemble script with a wrapper
+    # that validates all pip packages against the pre-approved hash manifest before
+    # allowing pip to run. Fails the build if any new collection dependency appears.
+    - COPY _build/verify/verify-requirements.py /build/verify-requirements.py
+    - COPY _build/verify/verified-packages.txt /build/verified-packages.txt
+    # Save the real assemble FIRST, then overwrite with wrapper.
+    - RUN cp /output/scripts/assemble /output/scripts/assemble.orig
+    - "RUN printf '#!/bin/bash\\nset -e\\npython3 /build/verify-requirements.py /tmp/src/requirements.txt /build/verified-packages.txt\\nexec /output/scripts/assemble.orig \"$@\"\\n' > /output/scripts/assemble && chmod +x /output/scripts/assemble"
+
+  append_final:
+    - LABEL maintainer="Mike Savage"
+    - LABEL quay.expires-after="45d"
+...

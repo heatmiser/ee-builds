@@ -1,32 +1,15 @@
 ---
 collections:
-  # Core utilities
+  # First-boot renderer requirements only — no OCP/Kubernetes capabilities here.
+  # Site orchestration (kubernetes.core, dellemc.openmanage, rhvp.ocp_landing_zone)
+  # lives in dcm-base-ee and dcm-ocp-ee-4.x.
+
   - name: ansible.posix
     version: 2.1.0
-  - name: ansible.utils
-    version: 6.0.0
-  - name: community.general
-    version: 12.1.0
 
-  # Container management
-  - name: containers.podman
-    version: 1.18.0
-
-  # OpenShift / Kubernetes
-  - name: kubernetes.core
-    version: ">=3.1.0"
-
-  # Cryptography
   - name: community.crypto
     version: ">=2.0.0"
 
-  # Dell baremetal management
-  - name: dellemc.openmanage
-    version: ">=9.0.0"
-
-  # OCP landing zone automation (private repo)
-  - name: rhvp.ocp_landing_zone
-    type: git
-    source: https://github.com/heatmiser/rhvp.ocp_landing_zone.git
-    version: v0.1.1
+  - name: containers.podman
+    version: 1.18.0
 ...
