@@ -1,0 +1,34 @@
+---
+version: 3
+
+images:
+  base_image:
+    name: registry.redhat.io/ansible-automation-platform-25/ee-minimal-rhel9:latest
+
+dependencies:
+  galaxy: files/requirements.yml
+  python: files/requirements.txt
+  system: files/bindep.txt
+  ansible_runner:
+    package_pip: ansible-runner
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_files:
+  - src: files/requirements.yml
+    dest: configs
+
+additional_build_steps:
+  prepend_base:
+    - RUN $PYCMD -m pip install --upgrade pip setuptools
+
+  prepend_galaxy:
+    # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
+    - ARG COLLECTION_TOKEN
+    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+  append_final:
+    - LABEL maintainer="Mike Savage"
+    - LABEL quay.expires-after="45d"
+...

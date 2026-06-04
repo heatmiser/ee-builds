@@ -96,7 +96,9 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v2
         with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.ref != '' && github.event.pull_request.head.ref || 'main' }}
 
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
@@ -131,6 +133,7 @@ jobs:
         run: |
           ansible-builder build -v 3 \
           --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
+          --build-arg COLLECTION_TOKEN=${{ secrets.COLLECTION_TOKEN }} \
           --context=../${{ env.EE }} \
           --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
           --tag=${{ env.EE }}:${{ github.sha }}
