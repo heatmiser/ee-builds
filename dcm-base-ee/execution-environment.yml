@@ -23,11 +23,15 @@ additional_build_files:
 
 additional_build_steps:
   prepend_base:
+    # ee-minimal-rhel9 (AAP 2.6) does not ship the pip Python module.
+    # Install it first so $PYCMD -m pip works here and in the final stage.
+    - RUN microdnf install -y python3-pip && microdnf clean all
     - RUN $PYCMD -m pip install --upgrade pip setuptools
     # EPEL 9 — required for isomd5sum and xorriso (dellemc.openmanage bindep).
     # Installed in prepend_base so packages reach the final stage (FROM base).
-    - RUN microdnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-    - RUN microdnf install -y isomd5sum xorriso
+    # UBI 9 minimal microdnf does not support URL installs; use rpm directly.
+    - RUN rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+    - RUN microdnf install -y isomd5sum xorriso && microdnf clean all
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
