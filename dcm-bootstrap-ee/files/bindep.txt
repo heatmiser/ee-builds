@@ -1,0 +1,9 @@
+# System binary dependencies for dcm-bootstrap-ee
+#
+# git     — ansible.builtin.git (baremetal_discovery_iso_build clones upstream repo)
+# jq      — general JSON utility available at runtime
+# openssl — ansible.builtin.command: openssl rand (TSIG key generation in first_boot_render.yml)
+
+git     [platform:rpm]
+jq      [platform:rpm]
+openssl [platform:rpm]

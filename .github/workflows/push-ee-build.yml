@@ -91,6 +91,7 @@ jobs:
         run: |
           ansible-builder build -v 3 \
           --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
+          --build-arg COLLECTION_TOKEN=${{ secrets.COLLECTION_TOKEN }} \
           --context=../${{ env.EE }} \
           --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
           --tag=${{ env.EE }}:${{ github.sha }}
