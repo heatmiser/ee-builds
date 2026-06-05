@@ -33,6 +33,10 @@ additional_build_steps:
     # (EPEL policy: do not package what is already in RHEL). CentOS Stream 9 is the
     # public upstream for RHEL 9 — same ABI, no subscription required.
     - "RUN printf '[cs9-baseos]\\nname=CentOS Stream 9 BaseOS\\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n\\n[cs9-appstream]\\nname=CentOS Stream 9 AppStream\\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n' > /etc/yum.repos.d/cs9.repo && microdnf install -y isomd5sum xorriso && rm -f /etc/yum.repos.d/cs9.repo && microdnf clean all"
+    # openshift-clients stub — kubernetes.core bindep requires this package.
+    # Version 0.0.0 placeholder; each dcm-ocp-ee-4.x upgrades it (rpm -Uvh) with
+    # a version-specific stub alongside the real oc binary in /usr/local/bin/.
+    - "RUN microdnf install -y rpm-build && { echo 'Name: openshift-clients'; echo 'Version: 0.0.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools stub'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies kubernetes.core bindep check. Upgraded by dcm-ocp-ee-4.x.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-0.0.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
@@ -49,10 +53,12 @@ additional_build_steps:
     - RUN cp /output/scripts/assemble /output/scripts/assemble.orig
     - "RUN printf '#!/bin/bash\\nset -e\\npython3 /build/verify-requirements.py /tmp/src/requirements.txt /build/verified-packages.txt\\nexec /output/scripts/assemble.orig \"$@\"\\n' > /output/scripts/assemble && chmod +x /output/scripts/assemble"
 
-  prepend_final:
-    # Re-bootstrap pip in the final stage. ensurepip in prepend_base installs pip
-    # into the base layer, but the COPY --from=builder in the generated final stage
-    # shadows site-packages, leaving pip absent when ansible-builder installs dumb-init.
+  append_builder:
+    # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present
+    # in the builder stage's final filesystem state. COPY --from=builder in the
+    # generated final stage captures that state, making pip available for
+    # ansible-builder's dumb-init install. prepend_final runs before that COPY
+    # and is overwritten by it — append_builder is the correct insertion point.
     - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:

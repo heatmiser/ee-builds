@@ -25,10 +25,12 @@ additional_build_steps:
     - ARG COLLECTION_TOKEN
     - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
 
-  prepend_final:
-    # Re-bootstrap pip in the final stage. ensurepip in prepend_base installs pip
-    # into the base layer, but the COPY --from=builder in the generated final stage
-    # shadows site-packages, leaving pip absent when ansible-builder installs dumb-init.
+  append_builder:
+    # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present
+    # in the builder stage's final filesystem state. COPY --from=builder in the
+    # generated final stage captures that state, making pip available for
+    # ansible-builder's dumb-init install. prepend_final is too early — it runs
+    # before COPY --from=builder overwrites site-packages.
     - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
