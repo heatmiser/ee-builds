@@ -14,10 +14,11 @@ options:
 
 additional_build_steps:
   prepend_base:
-    # ee-minimal-rhel9 (AAP 2.6) does not ship the pip Python module.
-    # Install it first so $PYCMD -m pip works here and in the final stage.
-    - RUN microdnf install -y python3-pip && microdnf clean all
-    - RUN $PYCMD -m pip install --upgrade pip setuptools
+    # AAP 2.6 base image ships ansible for Python 3.12 but removes pip post-install.
+    # Use ensurepip (stdlib, no RPM) to bootstrap pip for $PYCMD without touching
+    # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
+    # redirects /usr/bin/python3, breaking the ansible import check).
+    - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection

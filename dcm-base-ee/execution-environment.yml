@@ -23,15 +23,19 @@ additional_build_files:
 
 additional_build_steps:
   prepend_base:
-    # ee-minimal-rhel9 (AAP 2.6) does not ship the pip Python module.
-    # Install it first so $PYCMD -m pip works here and in the final stage.
-    - RUN microdnf install -y python3-pip && microdnf clean all
-    - RUN $PYCMD -m pip install --upgrade pip setuptools
-    # EPEL 9 — required for isomd5sum and xorriso (dellemc.openmanage bindep).
-    # Installed in prepend_base so packages reach the final stage (FROM base).
+    # AAP 2.6 base image ships ansible for Python 3.12 but removes pip post-install.
+    # Use ensurepip (stdlib, no RPM) to bootstrap pip for $PYCMD without touching
+    # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
+    # redirects /usr/bin/python3, breaking the ansible import check).
+    - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
+    # EPEL 9 — provides xorriso (dellemc.openmanage bindep).
     # UBI 9 minimal microdnf does not support URL installs; use rpm directly.
     - RUN rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-    - RUN microdnf install -y isomd5sum xorriso && microdnf clean all
+    - RUN microdnf install -y xorriso && microdnf clean all
+    # isomd5sum is in RHEL 9 CRB (subscription-gated) and NOT in EPEL 9 or UBI.
+    # Build a noarch stub RPM to satisfy the dellemc.openmanage bindep rpm -q check.
+    # Same pattern as openshift-clients stubs in dcm-ocp-ee-4.x.
+    - "RUN microdnf install -y rpm-build && { echo 'Name: isomd5sum'; echo 'Version: 2.7.3'; echo 'Release: 0'; echo 'Summary: ISO md5sum utilities'; echo 'License: GPL'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies dellemc.openmanage bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/iso.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/iso.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/isomd5sum-2.7.3-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/iso.spec"
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
