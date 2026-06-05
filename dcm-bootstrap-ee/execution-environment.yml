@@ -14,6 +14,11 @@ options:
 
 additional_build_steps:
   prepend_base:
+    # python3-cryptography (UBI 9 RPM, required by community.crypto bindep) depends on
+    # python3-3.9, which changes /usr/bin/python3 from 3.12 → 3.9. Pre-install here so
+    # assemble's bindep never triggers that symlink change mid-build. Restore symlink to
+    # 3.12 immediately so ensurepip bootstraps pip for the correct interpreter.
+    - "RUN microdnf install -y python3-cryptography && ln -sf /usr/bin/python3.12 /usr/bin/python3 && microdnf clean all"
     # AAP 2.6 base image ships ansible for Python 3.12 but removes pip post-install.
     # Use ensurepip (stdlib, no RPM) to bootstrap pip for $PYCMD without touching
     # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
