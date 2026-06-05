@@ -4,9 +4,9 @@
 # jq      — general JSON utility available at runtime
 # openssl — ansible.builtin.command: openssl rand (TSIG key generation)
 #
-# Note: isomd5sum and xorriso (dellemc.openmanage bindep) are installed via
-# EPEL 9 in prepend_base of execution-environment.yml — not listed here because
-# they are pre-installed before the assemble bindep check runs.
+# Note: isomd5sum, syslinux, and xorriso (dellemc.openmanage bindep) are installed
+# via CentOS Stream 9 in prepend_base of execution-environment.yml — not listed here
+# because they are pre-installed before the assemble bindep check runs.
 #
 # Note: openshift-clients (kubernetes.core bindep) is installed per OCP version
 # in each dcm-ocp-ee-4.x EE — not present in this base image.

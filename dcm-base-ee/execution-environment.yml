@@ -28,11 +28,11 @@ additional_build_steps:
     # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
     # redirects /usr/bin/python3, breaking the ansible import check).
     - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
-    # xorriso (baremetal_discovery_iso_build) and isomd5sum (dellemc.openmanage bindep)
-    # are in RHEL 9 AppStream/BaseOS but subscription-gated. They are NOT in EPEL 9
-    # (EPEL policy: do not package what is already in RHEL). CentOS Stream 9 is the
-    # public upstream for RHEL 9 — same ABI, no subscription required.
-    - "RUN printf '[cs9-baseos]\\nname=CentOS Stream 9 BaseOS\\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n\\n[cs9-appstream]\\nname=CentOS Stream 9 AppStream\\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n' > /etc/yum.repos.d/cs9.repo && microdnf install -y isomd5sum xorriso && rm -f /etc/yum.repos.d/cs9.repo && microdnf clean all"
+    # isomd5sum, xorriso (dellemc.openmanage bindep), and syslinux (dellemc.openmanage
+    # bindep) are in RHEL 9 BaseOS/AppStream but subscription-gated. They are NOT in
+    # EPEL 9 (EPEL policy: do not package what is already in RHEL). CentOS Stream 9 is
+    # the public upstream for RHEL 9 — same ABI, no subscription required.
+    - "RUN printf '[cs9-baseos]\\nname=CentOS Stream 9 BaseOS\\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n\\n[cs9-appstream]\\nname=CentOS Stream 9 AppStream\\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n' > /etc/yum.repos.d/cs9.repo && microdnf install -y isomd5sum syslinux xorriso && rm -f /etc/yum.repos.d/cs9.repo && microdnf clean all"
     # openshift-clients stub — kubernetes.core bindep requires this package.
     # Version 0.0.0 placeholder; each dcm-ocp-ee-4.x upgrades it (rpm -Uvh) with
     # a version-specific stub alongside the real oc binary in /usr/local/bin/.
