@@ -189,9 +189,11 @@ jobs:
   build-ocp-ees:
     # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee is available.
     # Uses the PR-tagged dcm-base-ee image pushed by build-ee as the FROM layer.
-    # Runs always so OCP EE builds are attempted even if unrelated EEs fail.
-    needs: [build-ee]
-    if: always()
+    # Only runs when dcm-base-ee is in the generated matrix — the OCP EE builds
+    # require a PR-tagged dcm-base-ee image which only exists when dcm-base-ee
+    # was built in this CI run.
+    needs: [prepare-matrix, build-ee]
+    if: always() && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
     runs-on: ubuntu-latest
     environment: test
     strategy:
