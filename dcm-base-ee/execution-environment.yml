@@ -28,14 +28,11 @@ additional_build_steps:
     # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
     # redirects /usr/bin/python3, breaking the ansible import check).
     - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
-    # EPEL 9 — provides xorriso (dellemc.openmanage bindep).
-    # UBI 9 minimal microdnf does not support URL installs; use rpm directly.
-    - RUN rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-    - RUN microdnf install -y xorriso && microdnf clean all
-    # isomd5sum is in RHEL 9 CRB (subscription-gated) and NOT in EPEL 9 or UBI.
-    # Build a noarch stub RPM to satisfy the dellemc.openmanage bindep rpm -q check.
-    # Same pattern as openshift-clients stubs in dcm-ocp-ee-4.x.
-    - "RUN microdnf install -y rpm-build && { echo 'Name: isomd5sum'; echo 'Version: 2.7.3'; echo 'Release: 0'; echo 'Summary: ISO md5sum utilities'; echo 'License: GPL'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies dellemc.openmanage bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/iso.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/iso.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/isomd5sum-2.7.3-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/iso.spec"
+    # xorriso (baremetal_discovery_iso_build) and isomd5sum (dellemc.openmanage bindep)
+    # are in RHEL 9 AppStream/BaseOS but subscription-gated. They are NOT in EPEL 9
+    # (EPEL policy: do not package what is already in RHEL). CentOS Stream 9 is the
+    # public upstream for RHEL 9 — same ABI, no subscription required.
+    - "RUN printf '[cs9-baseos]\\nname=CentOS Stream 9 BaseOS\\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n\\n[cs9-appstream]\\nname=CentOS Stream 9 AppStream\\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n' > /etc/yum.repos.d/cs9.repo && microdnf install -y isomd5sum xorriso && rm -f /etc/yum.repos.d/cs9.repo && microdnf clean all"
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
@@ -51,6 +48,12 @@ additional_build_steps:
     # Save the real assemble FIRST, then overwrite with wrapper.
     - RUN cp /output/scripts/assemble /output/scripts/assemble.orig
     - "RUN printf '#!/bin/bash\\nset -e\\npython3 /build/verify-requirements.py /tmp/src/requirements.txt /build/verified-packages.txt\\nexec /output/scripts/assemble.orig \"$@\"\\n' > /output/scripts/assemble && chmod +x /output/scripts/assemble"
+
+  prepend_final:
+    # Re-bootstrap pip in the final stage. ensurepip in prepend_base installs pip
+    # into the base layer, but the COPY --from=builder in the generated final stage
+    # shadows site-packages, leaving pip absent when ansible-builder installs dumb-init.
+    - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
     - LABEL maintainer="Mike Savage"
