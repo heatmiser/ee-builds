@@ -1,0 +1,71 @@
+--index-url https://pypi.org/simple/
+--require-hashes
+
+# Generated 2026-06-04 against ee-minimal-rhel9 AAP 2.6 (Python 3.12, linux_x86_64)
+# Source: pip3 download --no-deps + pip3 hash
+# Covers: direct requirements from ansible.utils, dellemc.openmanage,
+#         kubernetes.core collections + all transitive dependencies.
+#
+# To update: run pip3 download --no-deps for the new package version,
+# run pip3 hash on the downloaded wheel, add entry and re-test.
+
+# --- direct requirements (from introspect output) ---
+
+jsonschema==4.17.3 \
+    --hash=sha256:a870ad254da1a8ca84b6a2905cac29d265f805acc57af304784962a2aa6508f6
+
+jsonpatch==1.33 \
+    --hash=sha256:0ae28c0cd062bbd8b8ecc26d7d164fbbea9652a1a3693f3b956c1eae5145dade
+
+kubernetes==36.0.2 \
+    --hash=sha256:faf9b5241b58de0c4a5069f2a0ffc8ac06fece7215156cd3d3ba081a78a858b6
+
+netaddr==1.3.0 \
+    --hash=sha256:c2c6a8ebe5554ce33b7d5b3a306b71bbb373e000bbbf2350dd5213cc56e3dbbe
+
+omsdk==1.2.518 \
+    --hash=sha256:d0ae3ada1182ca2b03acdd5acb3c73d730bf7e26262bb4ed5cffad7289d1a571
+
+requests-oauthlib==2.0.0 \
+    --hash=sha256:7dd8a5c40426b779b0868c404bdef9768deccf22749cde15852df527e6269b36
+
+textfsm==2.1.0 \
+    --hash=sha256:55886490474890fa09ade0e8c9555a913fd325724842293364dc44ea705b3616
+
+ttp==0.10.1 \
+    --hash=sha256:2c8bc871f7740b690c6df6fb8c9633be58fcda123eea3e53be40a79e4af54b83
+
+xmltodict==0.13.0 \
+    --hash=sha256:aa89e8fd76320154a40d19a0df04a4695fb9dc5ba977cbb68ab3e4eb225e7852
+
+# --- transitive dependencies ---
+
+durationpy==0.10 \
+    --hash=sha256:3b41e1b601234296b4fb368338fdcd3e13e0b4fb5b67345948f4f2bf9868b286
+
+future==1.0.0 \
+    --hash=sha256:929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216
+
+ipaddress==1.0.23 \
+    --hash=sha256:6e0f4a39e66cb5bb9a137b00276a2eff74f93b71dcbdad6f10ff7df9d3557fcc
+
+jsonpointer==3.1.1 \
+    --hash=sha256:8ff8b95779d071ba472cf5bc913028df06031797532f08a7d5b602d8b2a488ca
+
+oauthlib==3.3.1 \
+    --hash=sha256:88119c938d2b8fb88561af5f6ee0eec8cc8d552b7bb1f712743136eb7523b7a1
+
+pyasn1==0.6.3 \
+    --hash=sha256:a80184d120f0864a52a073acc6fc642847d0be408e7c7252f31390c0f4eadcde
+
+pysnmp==7.1.27 \
+    --hash=sha256:314ad98d94d9ed445d4bb07721c374ec6ca4158fb41f92b9bc72feb9557513f7
+
+pysnmp-mibs==0.1.6 \
+    --hash=sha256:5e153ebe8e767c07940cea435f866c623ff6b2376155c7da75085b08d3774d48
+
+python-dateutil==2.9.0.post0 \
+    --hash=sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427
+
+websocket-client==1.9.0 \
+    --hash=sha256:af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef

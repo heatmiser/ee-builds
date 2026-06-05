@@ -1,8 +1,3 @@
-# Python dependencies for Ansible collections
-#
-# ansible-builder auto-discovers per-collection requirements.txt files;
-# only declare packages here that need explicit version control or are
-# not covered by collection auto-discovery.
-
-# kubernetes.core Python client
-kubernetes>=24.2.0
+# No Python packages required for the first-boot renderer collection set.
+# ansible.posix, community.crypto, and containers.podman have no pip dependencies
+# beyond what is pre-installed in ee-minimal-rhel9 (AAP 2.6).

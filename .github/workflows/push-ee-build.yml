@@ -140,3 +140,74 @@ jobs:
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
           echo "> \`podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+  build-ocp-ees:
+    # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee:latest is available
+    # on quay.io before the per-OCP EE layers pull it as their base_image.
+    needs: [build-ee]
+    if: always()
+    runs-on: ubuntu-latest
+    environment: deploy
+    strategy:
+      matrix:
+        ocp_version: ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21']
+      fail-fast: false
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Install python requirements (ansible-builder)
+        run: pip install -r requirements.txt
+
+      - name: Define environment variables
+        run: |
+          echo "EE=dcm-ocp-ee-${{ matrix.ocp_version }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+
+      - name: Substitute quay username in base EE reference
+        run: |
+          sed -i "s/my_quay_username/${{ secrets.QUAY_USERNAME }}/1" \
+            dcm-ocp-ee-${{ matrix.ocp_version }}/execution-environment.yml
+
+      - name: Log in to quay.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Log in to registry.redhat.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: registry.redhat.io
+          username: ${{ secrets.REDHAT_USERNAME }}
+          password: ${{ secrets.REDHAT_PASSWORD }}
+
+      - name: Substitute token for automation hub
+        run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
+
+      - name: Build image
+        working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
+        run: |
+          ansible-builder build -v 3 \
+          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
+          --context=../dcm-ocp-ee-${{ matrix.ocp_version }} \
+          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
+          --tag=${{ env.EE }}:${{ github.sha }}
+
+      - name: Push To quay.io
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ env.EE }}
+          tags: ${{ env.IMAGE_TAG }} ${{ github.sha }}
+          registry: quay.io/${{ secrets.QUAY_USERNAME }}/
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Print summary
+        run: |
+          echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
+          echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "> \`podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY

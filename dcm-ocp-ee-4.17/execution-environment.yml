@@ -1,0 +1,29 @@
+---
+version: 3
+
+images:
+  base_image:
+    # dcm-base-ee provides all common collections, Python lockfile, and system packages.
+    name: quay.io/my_quay_username/dcm-base-ee:latest
+
+dependencies:
+  galaxy: files/requirements.yml
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_steps:
+  prepend_base:
+    # Install rpm-build to create the openshift-clients stub RPM.
+    # Install oc client from public OpenShift mirror (no subscription required).
+    # The stub RPM satisfies the kubernetes.core bindep rpm -q check without
+    # requiring RHOCP subscription repos in the build environment.
+    - RUN microdnf install -y rpm-build curl tar
+    - RUN curl -sSL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable-4.17/openshift-client-linux.tar.gz | tar xzf - -C /usr/local/bin oc kubectl
+    - "RUN { echo 'Name: openshift-clients'; echo 'Version: 4.17.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub package — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define \"_topdir /tmp/rpmbuild\" -bb /tmp/oc.spec && rpm -Uvh /tmp/rpmbuild/RPMS/noarch/openshift-clients-4.17.0-0.noarch.rpm && rm -rf /tmp/rpmbuild /tmp/oc.spec"
+
+  append_final:
+    - LABEL maintainer="Mike Savage"
+    - LABEL quay.expires-after="45d"
+    - LABEL ocp.version="4.17"
+...

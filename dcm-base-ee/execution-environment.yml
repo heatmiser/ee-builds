@@ -1,0 +1,72 @@
+---
+version: 3
+
+images:
+  base_image:
+    name: registry.redhat.io/ansible-automation-platform-26/ee-minimal-rhel9:latest
+
+dependencies:
+  galaxy: files/requirements.yml
+  python: files/requirements.txt
+  system: files/bindep.txt
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_files:
+  # Supply chain enforcement — verify-requirements.py validates ansible-builder's
+  # introspect output against the pre-approved hash manifest before pip runs.
+  - src: files/verify-requirements.py
+    dest: verify
+  - src: files/verified-packages.txt
+    dest: verify
+
+additional_build_steps:
+  prepend_base:
+    # python3-cryptography (UBI 9 RPM) depends on python3-3.9, which changes the
+    # /usr/bin/python3 symlink from 3.12 → 3.9. Pre-install here so assemble's bindep
+    # never triggers that symlink change mid-build. Restore the symlink to 3.12
+    # immediately so ensurepip bootstraps pip for the correct interpreter.
+    - "RUN microdnf install -y python3-cryptography && ln -sf /usr/bin/python3.12 /usr/bin/python3 && microdnf clean all"
+    # AAP 2.6 base image ships ansible for Python 3.12 but removes pip post-install.
+    # Use ensurepip (stdlib, no RPM) to bootstrap pip for $PYCMD without touching
+    # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
+    # redirects /usr/bin/python3, breaking the ansible import check).
+    - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
+    # isomd5sum, xorriso (dellemc.openmanage bindep), and syslinux (dellemc.openmanage
+    # bindep) are in RHEL 9 BaseOS/AppStream but subscription-gated. They are NOT in
+    # EPEL 9 (EPEL policy: do not package what is already in RHEL). CentOS Stream 9 is
+    # the public upstream for RHEL 9 — same ABI, no subscription required.
+    - "RUN printf '[cs9-baseos]\\nname=CentOS Stream 9 BaseOS\\nbaseurl=https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n\\n[cs9-appstream]\\nname=CentOS Stream 9 AppStream\\nbaseurl=https://mirror.stream.centos.org/9-stream/AppStream/x86_64/os/\\nenabled=1\\ngpgcheck=0\\n' > /etc/yum.repos.d/cs9.repo && microdnf install -y isomd5sum syslinux xorriso && rm -f /etc/yum.repos.d/cs9.repo && microdnf clean all"
+    # openshift-clients stub — kubernetes.core bindep requires this package.
+    # Version 0.0.0 placeholder; each dcm-ocp-ee-4.x upgrades it (rpm -Uvh) with
+    # a version-specific stub alongside the real oc binary in /usr/local/bin/.
+    - "RUN microdnf install -y rpm-build && { echo 'Name: openshift-clients'; echo 'Version: 0.0.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools stub'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies kubernetes.core bindep check. Upgraded by dcm-ocp-ee-4.x.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-0.0.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
+
+  prepend_galaxy:
+    # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
+    - ARG COLLECTION_TOKEN
+    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+
+  prepend_builder:
+    # Supply chain hook: replace the ansible-builder assemble script with a wrapper
+    # that validates all pip packages against the pre-approved hash manifest before
+    # allowing pip to run. Fails the build if any new collection dependency appears.
+    - COPY _build/verify/verify-requirements.py /build/verify-requirements.py
+    - COPY _build/verify/verified-packages.txt /build/verified-packages.txt
+    # Save the real assemble FIRST, then overwrite with wrapper.
+    - RUN cp /output/scripts/assemble /output/scripts/assemble.orig
+    - "RUN printf '#!/bin/bash\\nset -e\\npython3 /build/verify-requirements.py /tmp/src/requirements.txt /build/verified-packages.txt\\nexec /output/scripts/assemble.orig \"$@\"\\n' > /output/scripts/assemble && chmod +x /output/scripts/assemble"
+
+  append_builder:
+    # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present
+    # in the builder stage's final filesystem state. COPY --from=builder in the
+    # generated final stage captures that state, making pip available for
+    # ansible-builder's dumb-init install. prepend_final runs before that COPY
+    # and is overwritten by it — append_builder is the correct insertion point.
+    - RUN $PYCMD -m ensurepip --upgrade
+
+  append_final:
+    - LABEL maintainer="Mike Savage"
+    - LABEL quay.expires-after="45d"
+...

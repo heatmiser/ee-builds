@@ -1,0 +1,8 @@
+# Python dependencies for Ansible collections
+#
+# ansible-builder auto-discovers per-collection requirements.txt files;
+# only declare packages here that need explicit version control or are
+# not covered by collection auto-discovery.
+
+# kubernetes.core Python client
+kubernetes>=24.2.0

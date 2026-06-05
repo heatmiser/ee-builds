@@ -3,30 +3,40 @@ version: 3
 
 images:
   base_image:
-    name: registry.redhat.io/ansible-automation-platform-25/ee-minimal-rhel9:latest
+    name: registry.redhat.io/ansible-automation-platform-26/ee-minimal-rhel9:latest
 
 dependencies:
   galaxy: files/requirements.yml
-  python: files/requirements.txt
   system: files/bindep.txt
-  ansible_runner:
-    package_pip: ansible-runner
 
 options:
   package_manager_path: /usr/bin/microdnf
 
-additional_build_files:
-  - src: files/requirements.yml
-    dest: configs
-
 additional_build_steps:
   prepend_base:
-    - RUN $PYCMD -m pip install --upgrade pip setuptools
+    # python3-cryptography (UBI 9 RPM, required by community.crypto bindep) depends on
+    # python3-3.9, which changes /usr/bin/python3 from 3.12 → 3.9. Pre-install here so
+    # assemble's bindep never triggers that symlink change mid-build. Restore symlink to
+    # 3.12 immediately so ensurepip bootstraps pip for the correct interpreter.
+    - "RUN microdnf install -y python3-cryptography && ln -sf /usr/bin/python3.12 /usr/bin/python3 && microdnf clean all"
+    # AAP 2.6 base image ships ansible for Python 3.12 but removes pip post-install.
+    # Use ensurepip (stdlib, no RPM) to bootstrap pip for $PYCMD without touching
+    # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
+    # redirects /usr/bin/python3, breaking the ansible import check).
+    - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
 
   prepend_galaxy:
     # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
     - ARG COLLECTION_TOKEN
-    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/"
+    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+
+  append_builder:
+    # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present
+    # in the builder stage's final filesystem state. COPY --from=builder in the
+    # generated final stage captures that state, making pip available for
+    # ansible-builder's dumb-init install. prepend_final is too early — it runs
+    # before COPY --from=builder overwrites site-packages.
+    - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
     - LABEL maintainer="Mike Savage"
