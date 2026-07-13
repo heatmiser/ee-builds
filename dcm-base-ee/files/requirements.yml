@@ -28,5 +28,5 @@ collections:
   - name: rhvp.ocp_landing_zone
     type: git
     source: https://github.com/heatmiser/rhvp.ocp_landing_zone.git
-    version: 0.3.4
+    version: 0.3.6
 ...
