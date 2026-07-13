@@ -1,8 +1,7 @@
 ---
 collections:
   # First-boot renderer requirements only — no OCP/Kubernetes capabilities here.
-  # Site orchestration (kubernetes.core, dellemc.openmanage, rhvp.ocp_landing_zone)
-  # lives in dcm-base-ee and dcm-ocp-ee-4.x.
+  # Site orchestration (kubernetes.core, dellemc.openmanage) lives in dcm-ocp-ee-4.x.
 
   - name: ansible.posix
     version: 2.1.0
@@ -12,4 +11,9 @@ collections:
 
   - name: containers.podman
     version: 1.18.0
+
+  - name: rhvp.ocp_landing_zone
+    type: git
+    source: https://github.com/heatmiser/rhvp.ocp_landing_zone.git
+    version: 0.3.5
 ...
