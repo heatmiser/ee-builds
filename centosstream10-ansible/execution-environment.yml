@@ -34,7 +34,7 @@ additional_build_steps:
 
   append_final:
     - LABEL maintainer="Mike Savage"
-    - LABEL quay.expires-after=90d"
+    - LABEL quay.expires-after="90d"
     - ENV container=podman
     - ADD _build/scripts/customize.sh /tmp/customize.sh
     - RUN chmod +x /tmp/customize.sh && /tmp/customize.sh && rm /tmp/customize.sh
