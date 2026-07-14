@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      ee_name:
+        description: 'EE directory to build (e.g. dcm-bootstrap-ee, dcm-base-ee)'
+        required: true
+        default: 'dcm-bootstrap-ee'
 
 jobs:
   prepare-matrix:
@@ -17,14 +23,21 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Generate matrix  
+    - name: Generate matrix (push)
       id: generate-matrix
+      if: github.event_name == 'push'
       working-directory: ${{ github.workspace }}
       run: |
         python -u .github/workflows/generate_matrix.py \
         --start-ref $(git rev-parse HEAD^1) \
         --end-ref $(git rev-parse HEAD) \
         --output matrix_output.json
+
+    - name: Generate matrix (workflow_dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      working-directory: ${{ github.workspace }}
+      run: |
+        echo '{"include":[{"ee":"${{ inputs.ee_name }}"}]}' > matrix_output.json
 
     - name: Read matrix
       id: set-matrix
