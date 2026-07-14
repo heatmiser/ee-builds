@@ -158,7 +158,7 @@ jobs:
     # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee:latest is available
     # on quay.io before the per-OCP EE layers pull it as their base_image.
     needs: [build-ee]
-    if: always()
+    if: needs.build-ee.result == 'success'
     runs-on: ubuntu-latest
     environment: deploy
     strategy:
