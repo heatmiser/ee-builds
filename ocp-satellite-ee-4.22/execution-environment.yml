@@ -1,0 +1,45 @@
+---
+version: 3
+
+images:
+  base_image:
+    # ee-supported-rhel9 provides a richer Python/system baseline than ee-minimal,
+    # including pip, setuptools, and common collection Python deps. This avoids
+    # the cryptography/pip workarounds required when building from ee-minimal.
+    name: registry.redhat.io/ansible-automation-platform-26/ee-supported-rhel9:latest
+
+dependencies:
+  galaxy: files/requirements.yml
+  python: files/requirements.txt
+  system: files/bindep.txt
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_steps:
+  prepend_base:
+    # openshift-clients stub RPM — satisfies the kubernetes.core bindep check.
+    # The real oc/kubectl/openshift-install binaries are host-level on the Arceus
+    # bootc host (/usr/local/bin/); the EE does not need them for runtime tasks.
+    # kubernetes.core modules use the Python kubernetes client library (not the oc
+    # binary) for API calls, so only the stub RPM is needed here.
+    - RUN microdnf install -y rpm-build && microdnf clean all
+    - "RUN { echo 'Name: openshift-clients'; echo 'Version: 4.22.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub package — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define \"_topdir /tmp/rpmbuild\" -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-4.22.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
+
+  prepend_galaxy:
+    # COLLECTION_TOKEN: authenticates to GitHub for elise.quadlet (private repo).
+    - ARG COLLECTION_TOKEN
+    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+    # GITLAB_TOKEN: authenticates to corporate GitLab for heatmiser.ocp_satellite.
+    # NOTE: This EE must be built from a machine with VPN access to
+    # gitlab.cee.redhat.com, OR heatmiser.ocp_satellite must be pre-packaged as
+    # a tarball in the build context. The standard GitHub Actions runners in
+    # heatmiser/ee-builds do NOT have VPN access; build manually or use a
+    # self-hosted runner with VPN connectivity.
+    - ARG GITLAB_TOKEN
+    - RUN git config --global url."https://oauth2:${GITLAB_TOKEN}@gitlab.cee.redhat.com/".insteadOf "https://gitlab.cee.redhat.com/" # zizmor: ignore[secrets-outside-env]
+
+  append_final:
+    - LABEL maintainer="Mike Savage"
+    - LABEL quay.expires-after="45d"
+    - LABEL ocp.version="4.22"
