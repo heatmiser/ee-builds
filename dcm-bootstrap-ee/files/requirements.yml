@@ -16,4 +16,9 @@ collections:
     type: git
     source: https://github.com/heatmiser/rhvp.ocp_landing_zone.git
     version: 0.3.6
+
+  - name: elise.quadlet
+    type: git
+    source: https://github.com/heatmiser/elise.quadlet.git
+    version: 0.1.2
 ...
