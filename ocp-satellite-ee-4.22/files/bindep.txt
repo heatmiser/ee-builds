@@ -1,3 +1,8 @@
 # git — required for ansible-galaxy git-type collection installs at build time
 # (elise.quadlet and heatmiser.ocp_satellite are git-sourced)
-git     [platform:rpm]
+git         [platform:rpm]
+
+# python3-pip — required in the compile stage so the assemble script can run
+# /usr/bin/python3 -m pip to build Python wheels. The system Python 3.9 in
+# ee-supported-rhel9 does not ship pip by default.
+python3-pip [compile platform:rpm]
