@@ -13,6 +13,10 @@ dependencies:
   python: files/requirements.txt
   system: files/bindep.txt
 
+additional_build_files:
+  - src: ansible.cfg
+    dest: configs
+
 options:
   package_manager_path: /usr/bin/microdnf
 
@@ -27,6 +31,11 @@ additional_build_steps:
     - "RUN { echo 'Name: openshift-clients'; echo 'Version: 4.22.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub package — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define \"_topdir /tmp/rpmbuild\" -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-4.22.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
   prepend_galaxy:
+    # ansible.cfg configures galaxy_server_list: automation_hub (AH) + release_galaxy.
+    - ADD _build/configs/ansible.cfg /etc/ansible/ansible.cfg
+    # AH_TOKEN: passed via --build-arg; used to pull redhat.satellite from Automation Hub.
+    - ARG AH_TOKEN
+    - ENV ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_TOKEN=$AH_TOKEN
     # COLLECTION_TOKEN: authenticates to GitHub for elise.quadlet (private repo).
     - ARG COLLECTION_TOKEN
     - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
