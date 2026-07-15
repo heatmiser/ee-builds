@@ -27,9 +27,13 @@ additional_build_steps:
     - "RUN { echo 'Name: openshift-clients'; echo 'Version: 4.22.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub package — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define \"_topdir /tmp/rpmbuild\" -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-4.22.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
   prepend_galaxy:
-    # COLLECTION_TOKEN: authenticates to GitHub for private repos (elise.quadlet, heatmiser.ocp_satellite).
+    # COLLECTION_TOKEN: authenticates to GitHub for elise.quadlet (private repo).
     - ARG COLLECTION_TOKEN
     - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+    # OCP_SATELLITE_TOKEN: authenticates to GitHub for heatmiser/ocp_satellite (mirrored from GitLab).
+    # Repo-specific rewrite takes precedence over the generic github.com rewrite above.
+    - ARG OCP_SATELLITE_TOKEN
+    - RUN git config --global url."https://${OCP_SATELLITE_TOKEN}@github.com/heatmiser/ocp_satellite".insteadOf "https://github.com/heatmiser/ocp_satellite" # zizmor: ignore[secrets-outside-env]
 
   append_final:
     - LABEL maintainer="Mike Savage"
