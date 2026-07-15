@@ -11,3 +11,11 @@ python3-pip [compile platform:rpm]
 # systemd-python is a transitive dep from redhat.satellite; without libsystemd.pc
 # the pkg-config check in its setup.py fails at egg_info.
 systemd-devel [compile platform:rpm]
+
+# libxml2-devel — required to compile ovirt-engine-sdk-python (ov_xml_reader.c).
+# libcurl-devel — required to link ovirt-engine-sdk-python's C extension.
+# ovirt_engine_sdk_python is a transitive dep from redhat.rhv (pre-installed in
+# ee-supported-rhel9 base image); its bindep only gates these for rhel-8/centos-8,
+# so they are not auto-installed on RHEL 9.
+libxml2-devel [compile platform:rpm]
+libcurl-devel [compile platform:rpm]
