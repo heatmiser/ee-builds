@@ -6,3 +6,8 @@ git         [platform:rpm]
 # /usr/bin/python3 -m pip to build Python wheels. The system Python 3.9 in
 # ee-supported-rhel9 does not ship pip by default.
 python3-pip [compile platform:rpm]
+
+# systemd-devel — provides libsystemd.pc, required to compile systemd-python.
+# systemd-python is a transitive dep from redhat.satellite; without libsystemd.pc
+# the pkg-config check in its setup.py fails at egg_info.
+systemd-devel [compile platform:rpm]
