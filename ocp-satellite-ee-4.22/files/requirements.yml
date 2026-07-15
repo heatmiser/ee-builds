@@ -21,8 +21,8 @@ collections:
     source: https://github.com/heatmiser/elise.quadlet.git
     version: 0.1.1
 
-  # OCP + Satellite UPI automation (private — requires VPN access to gitlab.cee.redhat.com)
+  # OCP + Satellite UPI automation (private — mirrored from gitlab.cee.redhat.com/msavage/ocp_satellite)
   - name: heatmiser.ocp_satellite
     type: git
-    source: https://gitlab.cee.redhat.com/msavage/ocp_satellite.git
+    source: https://github.com/heatmiser/ocp_satellite.git
     version: main
