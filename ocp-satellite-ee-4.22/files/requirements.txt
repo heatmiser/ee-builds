@@ -1,0 +1,3 @@
+# Python client for kubernetes.core modules
+# (communicates with the OCP API directly — does not require the oc binary)
+kubernetes>=24.2.0

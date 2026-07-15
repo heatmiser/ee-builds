@@ -1,0 +1,3 @@
+# git — required for ansible-galaxy git-type collection installs at build time
+# (elise.quadlet and heatmiser.ocp_satellite are git-sourced)
+git     [platform:rpm]

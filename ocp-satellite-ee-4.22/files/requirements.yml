@@ -1,0 +1,28 @@
+---
+collections:
+  # Core utilities
+  - name: ansible.posix
+    version: ">=1.5.0"
+  - name: community.general
+    version: ">=9.0.0"
+
+  # Satellite automation (from Red Hat Automation Hub — requires AH_TOKEN at build time)
+  - name: redhat.satellite
+    version: ">=4.0.0"
+
+  # OpenShift / Kubernetes — for ocp_cluster_wait and ocp_haproxy_transition roles
+  # (uses Python kubernetes client; oc binary is host-level on the Arceus host)
+  - name: kubernetes.core
+    version: ">=3.0.0"
+
+  # Podman quadlet deployment — for first-boot dcm-* service unit rendering
+  - name: elise.quadlet
+    type: git
+    source: https://github.com/heatmiser/elise.quadlet.git
+    version: 0.1.1
+
+  # OCP + Satellite UPI automation (private — mirrored from gitlab.cee.redhat.com/msavage/ocp_satellite)
+  - name: heatmiser.ocp_satellite
+    type: git
+    source: https://github.com/heatmiser/ocp_satellite.git
+    version: main
