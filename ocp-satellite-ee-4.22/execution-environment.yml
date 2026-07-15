@@ -3,10 +3,10 @@ version: 3
 
 images:
   base_image:
-    # ee-supported-rhel9 provides a richer Python/system baseline than ee-minimal,
-    # including pip, setuptools, and common collection Python deps. This avoids
-    # the cryptography/pip workarounds required when building from ee-minimal.
-    name: registry.redhat.io/ansible-automation-platform-26/ee-supported-rhel9:latest
+    # ee-minimal-rhel9: ansible-core only, no pre-installed collections.
+    # Avoids inheriting transitive Python/system deps from the kitchen-sink
+    # collections bundled in ee-supported-rhel9 (redhat.rhv, vmware, eda, etc.).
+    name: registry.redhat.io/ansible-automation-platform-26/ee-minimal-rhel9:latest
 
 dependencies:
   galaxy: files/requirements.yml

@@ -1,21 +1,3 @@
 # git — required for ansible-galaxy git-type collection installs at build time
 # (elise.quadlet and heatmiser.ocp_satellite are git-sourced)
 git         [platform:rpm]
-
-# python3-pip — required in the compile stage so the assemble script can run
-# /usr/bin/python3 -m pip to build Python wheels. The system Python 3.9 in
-# ee-supported-rhel9 does not ship pip by default.
-python3-pip [compile platform:rpm]
-
-# systemd-devel — provides libsystemd.pc, required to compile systemd-python.
-# systemd-python is a transitive dep from redhat.satellite; without libsystemd.pc
-# the pkg-config check in its setup.py fails at egg_info.
-systemd-devel [compile platform:rpm]
-
-# libxml2-devel — required to compile ovirt-engine-sdk-python (ov_xml_reader.c).
-# libcurl-devel — required to link ovirt-engine-sdk-python's C extension.
-# ovirt_engine_sdk_python is a transitive dep from redhat.rhv (pre-installed in
-# ee-supported-rhel9 base image); its bindep only gates these for rhel-8/centos-8,
-# so they are not auto-installed on RHEL 9.
-libxml2-devel [compile platform:rpm]
-libcurl-devel [compile platform:rpm]
