@@ -33,11 +33,10 @@ additional_build_steps:
   prepend_galaxy:
     # ansible.cfg configures galaxy_server_list: automation_hub (AH) + release_galaxy.
     - ADD _build/configs/ansible.cfg /etc/ansible/ansible.cfg
-    # AH_TOKEN: passed via --build-arg; used to pull redhat.satellite from Automation Hub.
-    - ARG AH_TOKEN
-    - ENV ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_TOKEN=$AH_TOKEN
-    # COLLECTION_TOKEN: authenticates to GitHub for elise.quadlet (private repo).
+    # COLLECTION_TOKEN: dual-purpose — AH offline token for redhat.satellite, and
+    # GitHub PAT for elise.quadlet (private repo) git-type collection install.
     - ARG COLLECTION_TOKEN
+    - ENV ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_TOKEN=$COLLECTION_TOKEN
     - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
     # OCP_SATELLITE_TOKEN: authenticates to GitHub for heatmiser/ocp_satellite (mirrored from GitLab).
     # Repo-specific rewrite takes precedence over the generic github.com rewrite above.
