@@ -1,0 +1,129 @@
+name: Prod Image Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Image directory to build (e.g. gemini-ai-helpers)'
+        required: true
+        default: 'gemini-ai-helpers'
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      length: ${{ steps.set-matrix.outputs.length }}
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Generate matrix (push)
+      id: generate-matrix
+      if: github.event_name == 'push'
+      working-directory: ${{ github.workspace }}
+      run: |
+        python -u .github/workflows/generate_image_matrix.py \
+        --start-ref $(git rev-parse HEAD^1) \
+        --end-ref $(git rev-parse HEAD) \
+        --output-path matrix_output.json
+
+    - name: Generate matrix (workflow_dispatch)
+      if: github.event_name == 'workflow_dispatch'
+      working-directory: ${{ github.workspace }}
+      run: |
+        echo '{"include":[{"image":"${{ inputs.image_name }}"}]}' > matrix_output.json
+
+    - name: Read matrix
+      id: set-matrix
+      working-directory: ${{ github.workspace }}
+      run: |
+        MATRIX_JSON=$(cat matrix_output.json)
+        echo "::set-output name=matrix::$MATRIX_JSON"
+        MATRIX_LENGTH=$(echo $MATRIX_JSON | jq '.include | length')
+        echo $MATRIX_LENGTH
+        echo "::set-output name=length::$MATRIX_LENGTH"
+
+  build-image:
+    needs: [prepare-matrix]
+    if: ${{ needs.prepare-matrix.outputs.length != '0' }}
+    runs-on: ubuntu-latest
+    environment: deploy
+    strategy:
+      matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
+      fail-fast: false
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Define environment variables
+        run: |
+          echo "IMAGE=${{ matrix.image }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+
+      - name: Log in to quay.io
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Build image and create artifact
+        working-directory: ${{ matrix.image }}
+        run: |
+          podman build \
+          --tag=${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
+          --tag=${{ env.IMAGE }}:${{ github.sha }} \
+          .
+
+          COMMANDS_FILE="commands-${{ matrix.image }}.txt"
+          echo "" >> $COMMANDS_FILE
+          echo "Image: ${{ env.IMAGE }}" >> $COMMANDS_FILE
+          echo "" >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          echo "podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}" >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          echo "<details>" >> $COMMANDS_FILE
+          echo "<summary><b>More info...</b></summary>" >> $COMMANDS_FILE
+          echo "" >> $COMMANDS_FILE
+          echo "#### gemini-cli version" >> $COMMANDS_FILE
+          echo "" >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          podman run --rm ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} gemini --version >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          echo "" >> $COMMANDS_FILE
+          echo "#### Tool spot-check" >> $COMMANDS_FILE
+          echo "" >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          podman run --rm ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} sh -c 'jq --version && yq --version && rg --version && python3 -c "import jc; print(\"jc:\", jc.__version__)"' >> $COMMANDS_FILE
+          echo "\`\`\`" >> $COMMANDS_FILE
+          echo "</details>" >> $COMMANDS_FILE
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: commands-${{ matrix.image }}
+          path: ${{ matrix.image }}/commands-${{ matrix.image }}.txt
+
+      - name: Push To quay.io
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ env.IMAGE }}
+          tags: ${{ env.IMAGE_TAG }} ${{ github.sha }}
+          registry: quay.io/${{ secrets.QUAY_USERNAME }}/
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Print summary
+        run: |
+          echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
+          echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "> \`podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
