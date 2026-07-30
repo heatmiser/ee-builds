@@ -91,13 +91,13 @@ jobs:
           echo "#### gemini-cli version" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
-          podman run --rm ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} gemini --version >> $COMMANDS_FILE
+          podman run --rm --entrypoint gemini ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} --version >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
           echo "#### Tool spot-check" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
-          podman run --rm ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} sh -c 'jq --version && yq --version && rg --version && python3 -c "import jc; print(\"jc:\", jc.__version__)"' >> $COMMANDS_FILE
+          podman run --rm --entrypoint sh ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} -c 'jq --version && yq --version && rg --version && python3 -c "import jc; print(\"jc:\", jc.__version__)"' >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
           echo "</details>" >> $COMMANDS_FILE
 
