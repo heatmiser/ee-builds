@@ -1,8 +1,9 @@
 # System binary dependencies for dcm-base-ee
 #
-# git     — ansible.builtin.git (baremetal_discovery_iso_build clones upstream repo)
-# jq      — general JSON utility available at runtime
-# openssl — ansible.builtin.command: openssl rand (TSIG key generation)
+# git          — ansible.builtin.git (baremetal_discovery_iso_build clones upstream repo)
+# jq           — general JSON utility available at runtime
+# openssl      — ansible.builtin.command: openssl rand (TSIG key generation)
+# httpd-tools  — htpasswd -niB (bcrypt htpasswd generation for Ironic API auth in rhvp.baremetal_ocp)
 #
 # Note: isomd5sum, syslinux, and xorriso (dellemc.openmanage bindep) are installed
 # via CentOS Stream 9 in prepend_base of execution-environment.yml — not listed here
@@ -11,6 +12,7 @@
 # Note: openshift-clients (kubernetes.core bindep) is installed per OCP version
 # in each dcm-ocp-ee-4.x EE — not present in this base image.
 
-git     [platform:rpm]
-jq      [platform:rpm]
-openssl [platform:rpm]
+git          [platform:rpm]
+jq           [platform:rpm]
+openssl      [platform:rpm]
+httpd-tools  [platform:rpm]
