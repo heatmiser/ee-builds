@@ -21,4 +21,9 @@ collections:
     type: git
     source: https://github.com/heatmiser/elise.quadlet.git
     version: 0.1.3
+
+  - name: rhvp.baremetal_ocp
+    type: git
+    source: https://github.com/heatmiser/rhvp.baremetal_ocp.git
+    version: 0.1.0
 ...
