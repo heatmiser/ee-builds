@@ -69,6 +69,18 @@ jobs:
           git fetch origin ${{ github.base_ref }}
           git fetch origin ${{ github.head_ref }}
 
+      - name: Configure git credentials for private collections
+        env:
+          RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+        run: |
+          git config --global \
+            url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf \
+            "https://github.com/heatmiser/rhvp.ocp_landing_zone"
+          git config --global \
+            url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf \
+            "https://github.com/heatmiser/rhvp.baremetal_ocp"
+
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
 
