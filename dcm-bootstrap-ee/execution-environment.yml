@@ -26,9 +26,11 @@ additional_build_steps:
     - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
 
   prepend_galaxy:
-    # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
-    - ARG COLLECTION_TOKEN
-    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+    # Inject per-repo tokens for private heatmiser collections
+    - ARG RHVP_OCP_LANDING_ZONE_TOKEN
+    - RUN git config --global url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf "https://github.com/heatmiser/rhvp.ocp_landing_zone" # zizmor: ignore[secrets-outside-env]
+    - ARG RHVP_BAREMETAL_OCP_TOKEN
+    - RUN git config --global url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf "https://github.com/heatmiser/rhvp.baremetal_ocp" # zizmor: ignore[secrets-outside-env]
 
   append_builder:
     # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present

@@ -104,7 +104,8 @@ jobs:
         run: |
           ansible-builder build -v 3 \
           --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
-          --build-arg COLLECTION_TOKEN=${{ secrets.COLLECTION_TOKEN }} \
+          --build-arg RHVP_OCP_LANDING_ZONE_TOKEN=${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }} \
+          --build-arg RHVP_BAREMETAL_OCP_TOKEN=${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }} \
           --build-arg OCP_SATELLITE_TOKEN=${{ secrets.OCP_SATELLITE_TOKEN }} \
           --context=../${{ env.EE }} \
           --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
