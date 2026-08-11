@@ -24,6 +24,10 @@ additional_build_steps:
     # system Python symlinks (microdnf python3-pip installs for Python 3.9 and
     # redirects /usr/bin/python3, breaking the ansible import check).
     - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
+    # openshift-clients stub — kubernetes.core bindep requires this package (rpm -q check).
+    # A no-op RPM satisfies the check; kubernetes.core uses the Python client library at
+    # runtime, not the oc binary, so no real binary is needed in this EE.
+    - "RUN microdnf install -y rpm-build && { echo 'Name: openshift-clients'; echo 'Version: 0.0.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools stub'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-0.0.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
   prepend_galaxy:
     # COLLECTION_TOKEN is the legacy broad-access secret passed by the base-branch
