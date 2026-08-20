@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    paths:
+      - '**/execution-environment.yml'
+      - '**/requirements.txt'
+      - '**/requirements.yml'
+      - '**/bindep.txt'
+      - '**/customize.sh'
   workflow_dispatch:
     inputs:
       ee_name:

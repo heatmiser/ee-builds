@@ -5,7 +5,13 @@ on:
     branches:
       - main
     types: [opened, reopened, synchronize]
-  workflow_dispatch:  
+    paths:
+      - '**/execution-environment.yml'
+      - '**/requirements.txt'
+      - '**/requirements.yml'
+      - '**/bindep.txt'
+      - '**/customize.sh'
+  workflow_dispatch:
 
 jobs:
   prepare-matrix:
