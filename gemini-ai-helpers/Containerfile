@@ -125,7 +125,7 @@ RUN chown -R gemini:gemini /opt/ai-helpers
 
 RUN mkdir -p /home/gemini/.gemini && chown -R gemini:gemini /home/gemini/.gemini
 
-ARG GEMINI_CLI_VERSION=0.53.0
+ARG GEMINI_CLI_VERSION=0.56.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION}
 
 COPY gemini-entrypoint.sh /usr/local/sbin/gemini-entrypoint.sh
