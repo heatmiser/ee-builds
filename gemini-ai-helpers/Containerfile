@@ -1,4 +1,4 @@
-FROM registry.access.redhat.com/ubi10/ubi:10.2@sha256:802583cce6369422f62434fccd9bf310655c065cc9f4f60a007faf095e57afc7
+FROM registry.access.redhat.com/ubi10/ubi:10.2@sha256:23b987022b8e994dcd354e75b301e5d994508e2363dc77056733d81054d6d157
 
 RUN dnf install -y \
     nodejs \
@@ -119,13 +119,13 @@ RUN useradd -m -u 1000 -s /bin/bash gemini
 
 ARG AI_HELPERS_REF=main
 RUN git clone --depth=1 --branch ${AI_HELPERS_REF} \
-    https://github.com/opendatahub-io/ai-helpers /opt/ai-helpers
+    https://github.com/heatmiser/ai-helpers /opt/ai-helpers
 RUN python3 /opt/ai-helpers/scripts/fetch_external_plugins.py /opt/ai-helpers
 RUN chown -R gemini:gemini /opt/ai-helpers
 
 RUN mkdir -p /home/gemini/.gemini && chown -R gemini:gemini /home/gemini/.gemini
 
-ARG GEMINI_CLI_VERSION=0.53.0
+ARG GEMINI_CLI_VERSION=0.56.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION}
 
 COPY gemini-entrypoint.sh /usr/local/sbin/gemini-entrypoint.sh

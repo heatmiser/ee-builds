@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    paths:
+      - '**/Containerfile'
   workflow_dispatch:
     inputs:
       image_name:
