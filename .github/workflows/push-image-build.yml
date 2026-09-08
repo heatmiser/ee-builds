@@ -93,13 +93,14 @@ jobs:
           echo "\`\`\`" >> $COMMANDS_FILE
           echo "podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}" >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
+          CLI_BINARY=$(awk '/cli_binary:/{print $2}' image.yaml)
           echo "<details>" >> $COMMANDS_FILE
           echo "<summary><b>More info...</b></summary>" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
-          echo "#### gemini-cli version" >> $COMMANDS_FILE
+          echo "#### ${CLI_BINARY} version" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
-          podman run --rm --entrypoint gemini ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} --version >> $COMMANDS_FILE
+          podman run --rm --entrypoint "${CLI_BINARY}" ${{ env.IMAGE }}:${{ env.IMAGE_TAG }} --version >> $COMMANDS_FILE
           echo "\`\`\`" >> $COMMANDS_FILE
           echo "" >> $COMMANDS_FILE
           echo "#### Tool spot-check" >> $COMMANDS_FILE
