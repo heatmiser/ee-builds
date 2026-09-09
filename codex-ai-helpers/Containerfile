@@ -12,6 +12,7 @@ RUN dnf install -y \
     which \
     jq \
     libsecret \
+    bubblewrap \
     && dnf clean all
 
 ARG SHELLCHECK_VERSION=v0.11.0
