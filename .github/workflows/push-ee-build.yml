@@ -10,6 +10,10 @@ on:
       - '**/requirements.yml'
       - '**/bindep.txt'
       - '**/customize.sh'
+      - '**/ansible.cfg'
+      - '**/ansible-collections.yml'
+      - '**/python-packages.txt'
+      - '**/system-packages.txt'
   workflow_dispatch:
     inputs:
       ee_name:
@@ -177,8 +181,9 @@ jobs:
   build-ocp-ees:
     # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee:latest is available
     # on quay.io before the per-OCP EE layers pull it as their base_image.
-    needs: [build-ee]
-    if: needs.build-ee.result == 'success'
+    # Only runs when dcm-base-ee is in the generated matrix.
+    needs: [prepare-matrix, build-ee]
+    if: always() && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
     runs-on: ubuntu-latest
     environment: deploy
     strategy:

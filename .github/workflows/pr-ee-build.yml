@@ -11,6 +11,10 @@ on:
       - '**/requirements.yml'
       - '**/bindep.txt'
       - '**/customize.sh'
+      - '**/ansible.cfg'
+      - '**/ansible-collections.yml'
+      - '**/python-packages.txt'
+      - '**/system-packages.txt'
   workflow_dispatch:
 
 jobs:

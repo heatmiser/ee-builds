@@ -43,7 +43,17 @@ def parse_arguments():
 
 def main():
     """Main function to generate a matrix based on directories containing any changed TARGET_FILES."""
-    TARGET_FILES = ["execution-environment.yml", "requirements.txt", "requirements.yml", "bindep.txt", "customize.sh"]
+    TARGET_FILES = [
+        "execution-environment.yml",
+        "requirements.txt",
+        "requirements.yml",
+        "bindep.txt",
+        "customize.sh",
+        "ansible.cfg",
+        "ansible-collections.yml",
+        "python-packages.txt",
+        "system-packages.txt",
+    ]
     # dcm-ocp-ee-4.x EEs require dcm-base-ee to be published first and are built
     # by the build-ocp-ees job after build-ee completes. Exclude from this matrix.
     DEPENDENT_EE_PREFIX = "dcm-ocp-ee-"

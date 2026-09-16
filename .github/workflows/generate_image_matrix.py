@@ -43,7 +43,13 @@ def parse_arguments():
 
 def main():
     """Main function to generate a matrix based on directories containing any changed TARGET_FILES."""
-    TARGET_FILES = ["Containerfile"]
+    TARGET_FILES = [
+        "Containerfile",
+        "image.yaml",
+        "codex-entrypoint.sh",
+        "gemini-entrypoint.sh",
+        "README.md",
+    ]
     args = parse_arguments()
     log_level = logging.DEBUG if args.log_level == 'DEBUG' else logging.INFO
     logger = setup_logger(log_level)

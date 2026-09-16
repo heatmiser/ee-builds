@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - '**/Containerfile'
+      - '**/image.yaml'
+      - '**/*entrypoint.sh'
+      - '**/README.md'
   workflow_dispatch:
     inputs:
       image_name:
