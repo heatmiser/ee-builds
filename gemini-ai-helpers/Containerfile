@@ -44,9 +44,9 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="/usr/local/bin/
 RUN curl -LsSf https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz | tar xzf - -C /usr/local/bin/ oc \
     && chmod +x /usr/local/bin/oc
 
-ARG GH_VERSION=2.89.0
-ARG GH_SHA256_AMD64=d0422caade520530e76c1c558da47daebaa8e1203d6b7ff10ad7d6faba3490d8
-ARG GH_SHA256_ARM64=9e64a623dfc242990aa5d9b3f507111149c4282f66b68eaad1dc79eeb13b9ce5
+ARG GH_VERSION=2.101.0
+ARG GH_SHA256_AMD64=9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+ARG GH_SHA256_ARM64=b57e8063f18862647c9d22727c32e9da1b963f8bf9db648fe123a6975695640f
 RUN set -eu; \
     arch="$(uname -m)"; \
     case "$arch" in \
@@ -59,9 +59,9 @@ RUN set -eu; \
     tar xzf /tmp/gh.tar.gz --strip-components=1 -C /usr/local/; \
     rm -f /tmp/gh.tar.gz
 
-ARG GLAB_VERSION=1.91.0
-ARG GLAB_SHA256_AMD64=31c5dd4b6f5752e4355997b3c4742c9245a7abbb60f39e58bcc4e582843e4869
-ARG GLAB_SHA256_ARM64=29fef489f40fefb615881de55d3b229fc909aaf730de700abe1f448945c5bfc2
+ARG GLAB_VERSION=1.120.0
+ARG GLAB_SHA256_AMD64=4e6c59de9f7ed2f304bf93aad01ea8f8a69584f0450ce90ad696ef81f69c69aa
+ARG GLAB_SHA256_ARM64=c60ebb4cb36f276714847a118845b9b4e69f46a8080c68b21ca63f158722cdea
 RUN set -eu; \
     arch="$(uname -m)"; \
     case "$arch" in \
@@ -125,7 +125,7 @@ RUN chown -R gemini:gemini /opt/ai-helpers
 
 RUN mkdir -p /home/gemini/.gemini && chown -R gemini:gemini /home/gemini/.gemini
 
-ARG GEMINI_CLI_VERSION=0.60.0
+ARG GEMINI_CLI_VERSION=0.61.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION}
 
 COPY gemini-entrypoint.sh /usr/local/sbin/gemini-entrypoint.sh
