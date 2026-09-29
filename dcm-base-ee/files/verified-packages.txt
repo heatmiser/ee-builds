@@ -11,6 +11,9 @@
 
 # --- direct requirements (from introspect output) ---
 
+defusedxml==0.7.1 \
+    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
+
 jsonschema==4.17.3 \
     --hash=sha256:a870ad254da1a8ca84b6a2905cac29d265f805acc57af304784962a2aa6508f6
 
