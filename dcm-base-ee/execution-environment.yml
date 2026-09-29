@@ -46,9 +46,13 @@ additional_build_steps:
     - "RUN microdnf install -y rpm-build && { echo 'Name: openshift-clients'; echo 'Version: 0.0.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools stub'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies kubernetes.core bindep check. Upgraded by dcm-ocp-ee-4.x.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-0.0.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
   prepend_galaxy:
-    # Inject COLLECTION_TOKEN for private heatmiser/rhvp.ocp_landing_zone collection
+    # COLLECTION_TOKEN is the legacy broad-access secret. Per-repo tokens override it
+    # when passed via --build-arg RHVP_OCP_LANDING_ZONE_TOKEN.
     - ARG COLLECTION_TOKEN
-    - RUN git config --global url."https://${COLLECTION_TOKEN}@github.com/".insteadOf "https://github.com/" # zizmor: ignore[secrets-outside-env]
+    - ARG RHVP_OCP_LANDING_ZONE_TOKEN=${COLLECTION_TOKEN}
+    - RUN git config --global url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf "https://github.com/heatmiser/rhvp.ocp_landing_zone" # zizmor: ignore[secrets-outside-env]
+    - ARG RHVP_BAREMETAL_OCP_TOKEN=${COLLECTION_TOKEN}
+    - RUN git config --global url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf "https://github.com/heatmiser/rhvp.baremetal_ocp" # zizmor: ignore[secrets-outside-env]
 
   prepend_builder:
     # Supply chain hook: replace the ansible-builder assemble script with a wrapper
@@ -71,4 +75,5 @@ additional_build_steps:
   append_final:
     - LABEL maintainer="Mike Savage"
     - LABEL quay.expires-after="45d"
+    - LABEL build.version="1.0.1"
 ...
