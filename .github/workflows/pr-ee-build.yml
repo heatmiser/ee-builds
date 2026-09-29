@@ -216,7 +216,7 @@ jobs:
     # require a PR-tagged dcm-base-ee image which only exists when dcm-base-ee
     # was built in this CI run.
     needs: [prepare-matrix, build-ee]
-    if: always() && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+    if: needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
     runs-on: ubuntu-latest
     environment: test
     strategy:

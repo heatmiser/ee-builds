@@ -183,7 +183,7 @@ jobs:
     # on quay.io before the per-OCP EE layers pull it as their base_image.
     # Only runs when dcm-base-ee is in the generated matrix.
     needs: [prepare-matrix, build-ee]
-    if: always() && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+    if: needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
     runs-on: ubuntu-latest
     environment: deploy
     strategy:
