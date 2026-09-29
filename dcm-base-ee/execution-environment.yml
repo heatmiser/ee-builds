@@ -71,4 +71,5 @@ additional_build_steps:
   append_final:
     - LABEL maintainer="Mike Savage"
     - LABEL quay.expires-after="45d"
+    - LABEL build.version="1.0.1"
 ...
