@@ -48,6 +48,7 @@ def main():
         "image.yaml",
         "codex-entrypoint.sh",
         "gemini-entrypoint.sh",
+        "opencode-entrypoint.sh",
         "README.md",
     ]
     args = parse_arguments()

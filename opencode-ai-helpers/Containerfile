@@ -1,0 +1,126 @@
+FROM registry.access.redhat.com/ubi10/ubi:10.2@sha256:802583cce6369422f62434fccd9bf310655c065cc9f4f60a007faf095e57afc7
+
+RUN dnf install -y \
+    nodejs \
+    python3 \
+    python3-devel \
+    rpm-build \
+    rpmdevtools \
+    curl \
+    git \
+    make \
+    which \
+    jq \
+    libsecret \
+    && dnf clean all
+
+ARG SHELLCHECK_VERSION=v0.11.0
+ARG SHELLCHECK_SHA256_X86_64=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+ARG SHELLCHECK_SHA256_AARCH64=12b331c1d2db6b9eb13cfca64306b1b157a86eb69db83023e261eaa7e7c14588
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  expected="$SHELLCHECK_SHA256_X86_64" ;; \
+      aarch64) expected="$SHELLCHECK_SHA256_AARCH64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf -o /tmp/shellcheck.tar.xz "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.${arch}.tar.xz"; \
+    echo "${expected}  /tmp/shellcheck.tar.xz" | sha256sum -c -; \
+    tar xJf /tmp/shellcheck.tar.xz --strip-components=1 -C /usr/local/bin/ "shellcheck-${SHELLCHECK_VERSION}/shellcheck"; \
+    rm -f /tmp/shellcheck.tar.xz
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="/usr/local/bin/" INSTALLER_NO_MODIFY_PATH=1 sh
+
+RUN curl -LsSf https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz | tar xzf - -C /usr/local/bin/ oc \
+    && chmod +x /usr/local/bin/oc
+
+ARG GH_VERSION=2.101.0
+ARG GH_SHA256_AMD64=9bca2d1c16825f109907a23307628a2f0698fbf99662b73a5cf0b020293072b8
+ARG GH_SHA256_ARM64=b57e8063f18862647c9d22727c32e9da1b963f8bf9db648fe123a6975695640f
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  expected="$GH_SHA256_AMD64"; dl_arch="amd64" ;; \
+      aarch64) expected="$GH_SHA256_ARM64"; dl_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf -o /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${dl_arch}.tar.gz"; \
+    echo "${expected}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/gh.tar.gz --strip-components=1 -C /usr/local/; \
+    rm -f /tmp/gh.tar.gz
+
+ARG GLAB_VERSION=1.120.0
+ARG GLAB_SHA256_AMD64=4e6c59de9f7ed2f304bf93aad01ea8f8a69584f0450ce90ad696ef81f69c69aa
+ARG GLAB_SHA256_ARM64=c60ebb4cb36f276714847a118845b9b4e69f46a8080c68b21ca63f158722cdea
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  expected="$GLAB_SHA256_AMD64"; dl_arch="amd64" ;; \
+      aarch64) expected="$GLAB_SHA256_ARM64"; dl_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf -o /tmp/glab.tar.gz "https://gitlab.com/gitlab-org/cli/-/releases/v${GLAB_VERSION}/downloads/glab_${GLAB_VERSION}_linux_${dl_arch}.tar.gz"; \
+    echo "${expected}  /tmp/glab.tar.gz" | sha256sum -c -; \
+    tar xzf /tmp/glab.tar.gz -C /usr/local/bin/ bin/glab --strip-components=1; \
+    rm -f /tmp/glab.tar.gz
+
+ARG YQ_VERSION=v4.53.3
+ARG YQ_SHA256_AMD64=fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4
+ARG YQ_SHA256_ARM64=578648e463a11c1b6db6010cbf41eafed6bee79466fcffa1bb446672cf7945ea
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  expected="$YQ_SHA256_AMD64"; dl_arch="amd64" ;; \
+      aarch64) expected="$YQ_SHA256_ARM64"; dl_arch="arm64" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf -o /tmp/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${dl_arch}"; \
+    echo "${expected}  /tmp/yq" | sha256sum -c -; \
+    install -m 0755 /tmp/yq /usr/local/bin/yq; \
+    rm -f /tmp/yq
+
+ARG RG_VERSION=15.2.0
+ARG RG_SHA256_X86_64=33e15bcf1624b25cdd2a55813a47a2f95dbe126268203e76aa6a585d1e7b149c
+ARG RG_SHA256_AARCH64=a740b91c82eaf9914cfedd353572f2791cbe0162c84101ee0951058f4dcbc90d
+RUN set -eu; \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  expected="$RG_SHA256_X86_64"; tarball="ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz" ;; \
+      aarch64) expected="$RG_SHA256_AARCH64"; tarball="ripgrep-${RG_VERSION}-aarch64-unknown-linux-gnu.tar.gz" ;; \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -LsSf -o /tmp/rg.tar.gz "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${tarball}"; \
+    echo "${expected}  /tmp/rg.tar.gz" | sha256sum -c -; \
+    mkdir -p /tmp/rg-extract && \
+    tar xzf /tmp/rg.tar.gz -C /tmp/rg-extract --strip-components=1 && \
+    install -m 0755 /tmp/rg-extract/rg /usr/local/bin/rg; \
+    rm -rf /tmp/rg.tar.gz /tmp/rg-extract
+
+RUN uv pip install --system --no-cache \
+    pytest \
+    requests \
+    pyyaml \
+    ruff \
+    tox \
+    tox-uv \
+    jc
+
+RUN useradd -m -u 1000 -s /bin/bash opencode
+
+ARG AI_HELPERS_REF=main
+RUN git clone --depth=1 --branch ${AI_HELPERS_REF} \
+    https://github.com/opendatahub-io/ai-helpers /opt/ai-helpers
+RUN python3 /opt/ai-helpers/scripts/fetch_external_plugins.py /opt/ai-helpers
+RUN chown -R opencode:opencode /opt/ai-helpers
+
+RUN mkdir -p /home/opencode/.local/share/opencode /home/opencode/.config/opencode && chown -R opencode:opencode /home/opencode/.local /home/opencode/.config
+
+ARG OPENCODE_VERSION=1.19.0
+RUN npm install -g opencode-ai@${OPENCODE_VERSION}
+
+COPY opencode-entrypoint.sh /usr/local/sbin/opencode-entrypoint.sh
+RUN chmod +x /usr/local/sbin/opencode-entrypoint.sh
+
+USER opencode
+
+ENTRYPOINT ["/usr/local/sbin/opencode-entrypoint.sh"]
