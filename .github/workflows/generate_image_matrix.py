@@ -46,6 +46,7 @@ def main():
     TARGET_FILES = [
         "Containerfile",
         "image.yaml",
+        "antigravity-entrypoint.sh",
         "codex-entrypoint.sh",
         "gemini-entrypoint.sh",
         "opencode-entrypoint.sh",
