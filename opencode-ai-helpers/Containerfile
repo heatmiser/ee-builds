@@ -115,8 +115,9 @@ RUN chown -R opencode:opencode /opt/ai-helpers
 
 RUN mkdir -p /home/opencode/.local/share/opencode /home/opencode/.config/opencode && chown -R opencode:opencode /home/opencode/.local /home/opencode/.config
 
-ARG OPENCODE_VERSION=1.19.4
-RUN npm install -g opencode-ai@${OPENCODE_VERSION}
+ARG OPENCODE_VERSION=2.0.28
+RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" \
+    && opencode --version
 
 COPY opencode-entrypoint.sh /usr/local/sbin/opencode-entrypoint.sh
 RUN chmod +x /usr/local/sbin/opencode-entrypoint.sh
