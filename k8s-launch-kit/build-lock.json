@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "source": {
+    "repository": "https://github.com/NVIDIA/k8s-launch-kit.git",
+    "revision": "85cda5098e21cee914d36ca6964c63f220e078d3",
+    "version": "v26.10.0-rc.5"
+  },
+  "platform": "linux/amd64",
+  "builderImage": "docker.io/library/golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b",
+  "runtimeImage": "nvcr.io/nvidia/distroless/go:v4.1.8@sha256:676c150ccfb5987f58bbee9accfa506d5519d4acf4252f799d311476a0a7f1b5",
+  "entrypoint": "/src/l8k",
+  "workingDirectory": "/src",
+  "publication": "local-only"
+}
