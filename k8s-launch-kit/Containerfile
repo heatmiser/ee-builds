@@ -1,0 +1,35 @@
+# All arguments are supplied from build-lock.json by build.sh.
+ARG BUILDER_IMAGE
+ARG RUNTIME_IMAGE
+FROM ${BUILDER_IMAGE} AS builder
+ARG L8K_VERSION
+ARG L8K_SOURCE_REVISION
+ARG L8K_BUILD_DATE
+ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64
+WORKDIR /workspace
+COPY source/ /workspace/
+RUN test -n "${L8K_VERSION}" && test -n "${L8K_SOURCE_REVISION}" && test -n "${L8K_BUILD_DATE}" && \
+    sha256sum go.mod go.sum > /tmp/module-inputs.sha256 && \
+    go mod download && \
+    make build VERSION="${L8K_VERSION}" GIT_COMMIT="${L8K_SOURCE_REVISION}" \
+      BUILD_DATE="${L8K_BUILD_DATE}" GOBUILD="go build -mod=readonly -trimpath -buildvcs=false" && \
+    sha256sum --check /tmp/module-inputs.sha256 && \
+    chmod 0755 build/l8k && chmod 0644 LICENSE && \
+    find profiles -type d -exec chmod 0755 {} + && \
+    find profiles -type f -exec chmod 0644 {} +
+
+FROM ${RUNTIME_IMAGE}
+ARG L8K_VERSION
+ARG L8K_SOURCE_REVISION
+ARG L8K_BUILD_DATE
+LABEL org.opencontainers.image.title="k8s-launch-kit" \
+      org.opencontainers.image.source="https://github.com/NVIDIA/k8s-launch-kit" \
+      org.opencontainers.image.version="${L8K_VERSION}" \
+      org.opencontainers.image.revision="${L8K_SOURCE_REVISION}" \
+      org.opencontainers.image.created="${L8K_BUILD_DATE}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+WORKDIR /src
+COPY --from=builder /workspace/build/l8k /src/l8k
+COPY --from=builder /workspace/profiles /src/profiles
+COPY --from=builder /workspace/LICENSE /src/LICENSE
+ENTRYPOINT ["/src/l8k"]

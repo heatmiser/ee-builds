@@ -1,0 +1,11 @@
+**/.git
+**/source.git
+**/.env
+**/auth
+**/*kubeconfig*
+**/*pull-secret*
+**/build
+**/bin
+**/*.log
+**/README.md
+**/tests
