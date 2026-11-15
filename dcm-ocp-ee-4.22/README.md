@@ -19,7 +19,7 @@ every matrix entry uses the same immutable digest. No base rebuild is required.
 |---|---|---|---|
 | `4.22.14` | `dcm-ocp-ee-4.22` | `:14` | No |
 | `4.22.22` | `dcm-ocp-ee-4.22` | `:22` | No |
-| `5.0.0` (naming example) | `dcm-ocp-ee-5.0` | `:0` | No |
+| `5.0.1` (naming example) | `dcm-ocp-ee-5.0` | `:1` | No |
 | Stable production build | Matching stream | Resolved patch | Yes |
 | Stable PR build | Matching stream, GHCR | None | No |
 

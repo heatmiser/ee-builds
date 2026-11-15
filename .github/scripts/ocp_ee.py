@@ -169,8 +169,9 @@ def image_tags(version, selection, commit, run_id, pr=""):
 
 
 def execute(argv, cwd=None):
-    if argv[0] == "ansible-builder":
-        with (Path(cwd).parent / "build.log").open("w") as log:
+    if argv[0] == "ansible-builder" or argv[:2] == ["podman", "build"]:
+        log_name = "builder.log" if argv[0] == "ansible-builder" else "build.log"
+        with (Path(cwd).parent / log_name).open("w") as log:
             subprocess.run(argv, cwd=cwd, check=True, text=True, stdout=log,
                            stderr=subprocess.STDOUT, timeout=3600)
         return ""
@@ -221,7 +222,7 @@ def base_diagnostic(stderr):
 def checked_operation(operation, argv, run=execute, cwd=None):
     """Expose fixed stage/reason labels, never argv, paths or exception text."""
     require(operation in {
-        "source revision", "EE build", "built image inspection", "installer verification",
+        "source revision", "EE context generation", "EE build", "built image inspection", "installer verification",
         "client verification", "image label inspection", "publication installer verification",
         "publication client verification", "image push",
     }, "Unsupported subprocess operation")
@@ -236,12 +237,13 @@ def checked_operation(operation, argv, run=execute, cwd=None):
         elif isinstance(error, subprocess.CalledProcessError):
             code = error.returncode if type(error.returncode) is int else "unavailable"
             status = f"failed (exit code {code})"
-            # The real Builder redirects both streams to this private file. Read
+            # Context generation and Podman redirect both streams privately. Read
             # only its tail, after execute() has closed/flushed it. Never emit it.
             captured = []
-            if operation == "EE build" and cwd is not None:
+            if operation in {"EE context generation", "EE build"} and cwd is not None:
+                log_name = "builder.log" if operation == "EE context generation" else "build.log"
                 try:
-                    with (Path(cwd).parent / "build.log").open("rb") as log:
+                    with (Path(cwd).parent / log_name).open("rb") as log:
                         log.seek(0, os.SEEK_END)
                         log.seek(max(0, log.tell() - 65536))
                         captured.append(log.read(65536).decode("utf-8", errors="replace"))
@@ -384,12 +386,16 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
     archive_hashes = stage_archives(version, source / "files/release", opener)
     base_digest = pinned_base(base, run)
     local_image = f"localhost/{image}:{tags[0]}"
-    # --unsetlabel also removes the expiry inherited from dcm-base-ee.
-    checked_operation("EE build", ["ansible-builder", "build", "--container-runtime=podman", "--verbosity=3",
-         "--file", "execution-environment.yml", "--context", str(output / "context"),
+    context = output / "context"
+    # Builder 3.0.0 cannot pass arbitrary runtime options. Generate the context,
+    # then build it directly so Podman can remove expiry inherited from the base.
+    checked_operation("EE context generation", ["ansible-builder", "create", "--verbosity=3",
+         "--file", "execution-environment.yml", "--output-filename", "Containerfile",
+         "--context", str(context)], run, cwd=source)
+    checked_operation("EE build", ["podman", "build", "--file", str(context / "Containerfile"),
          "--tag", local_image, "--build-arg", f"OCP_VERSION={version}",
          "--build-arg", f"EE_BASE_IMAGE={base_digest}",
-         "--extra-build-cli-args=--unsetlabel=quay.expires-after"], run, cwd=source)
+         "--unsetlabel=quay.expires-after", str(context)], run, cwd=context)
     image_id = normalize_image_id(checked_operation("built image inspection",
         ["podman", "image", "inspect", "--format", "{{.ID}}", local_image], run).strip())
     installer = checked_operation("installer verification",

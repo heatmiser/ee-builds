@@ -65,7 +65,7 @@ class Runner:
         self.commands.append(argv)
         if argv == ["git", "rev-parse", "HEAD"]:
             return COMMIT + "\n"
-        if argv[0] == "ansible-builder" or argv[:2] == ["podman", "pull"]:
+        if argv[0] == "ansible-builder" or argv[:2] in (["podman", "pull"], ["podman", "build"]):
             return ""
         if "{{json .RepoDigests}}" in argv:
             return json.dumps([BASE])
@@ -97,7 +97,7 @@ class VersionSelectionTests(unittest.TestCase):
                 EE.release_matrix(value)
 
     def test_configured_minor_and_major_streams_keep_patch_only_tags(self):
-        versions = ("4.22.22", "4.22.14", "5.0.0")
+        versions = ("4.22.22", "4.22.14", "5.0.1")
         entries = EE.release_matrix(",".join(versions))["include"]
         self.assertEqual([entry["stream"] for entry in entries], ["4.22", "4.22", "5.0"])
         for version in versions:
@@ -137,12 +137,14 @@ class VersionSelectionTests(unittest.TestCase):
                 else:
                     config["streams"]["5.0"][key] = value
                 path.write_text(json.dumps(config))
-                mirror = Mirror(version="5.0.0")
+                mirror = Mirror(version="5.0.1")
                 with patch.object(EE, "CONFIG", path), self.assertRaises(ValueError):
                     EE.resolve_release("stable-5.0", mirror)
                 self.assertEqual(mirror.urls, [])
 
     def test_patch_tags_and_unique_build_identity(self):
+        self.assertEqual(EE.image_tags("5.0.0", "5.0.0", COMMIT, "123-1"),
+                         ["0-aaaaaaaaaaaa-123-1", "0"])
         tags = EE.image_tags("4.22.14", "4.22.14", COMMIT, "123-1")
         self.assertEqual(tags, ["14-aaaaaaaaaaaa-123-1", "14"])
         self.assertNotIn("latest", tags)
@@ -165,7 +167,7 @@ class VersionSelectionTests(unittest.TestCase):
         self.assertTrue(all("/4.22.22/" in url for url in mirror.urls[1:]))
 
     def test_new_stream_stable_resolution_keeps_configured_mirror_prefix(self):
-        for version in ("4.22.14", "5.0.0"):
+        for version in ("4.22.14", "5.0.1"):
             stream = version.rsplit(".", 1)[0]
             mirror = Mirror(version=version)
             self.assertEqual(EE.resolve_release("stable-" + stream, mirror), version)
@@ -327,34 +329,37 @@ class PublicOutputTests(unittest.TestCase):
                         self.assertNotIn(secret, stderr.getvalue())
                         self.assertNotIn(encoded, stderr.getvalue())
 
-    def test_raw_builder_output_stays_local_on_success_failure_and_timeout(self):
+    def test_raw_context_and_build_output_stays_local_on_success_failure_and_timeout(self):
         secret = "synthetic-builder-output-secret"
-        for outcome in ("success", "failure", "timeout"):
-            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
-                source = Path(directory) / "source"
-                source.mkdir()
-                stdout, stderr = io.StringIO(), io.StringIO()
+        stages = ((["ansible-builder", "create"], "source", "builder.log"),
+                  (["podman", "build"], "context", "build.log"))
+        for command, subdirectory, log_name in stages:
+            for outcome in ("success", "failure", "timeout"):
+                with self.subTest(command=command, outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                    source = Path(directory) / subdirectory
+                    source.mkdir()
+                    stdout, stderr = io.StringIO(), io.StringIO()
 
-                def run(argv, **kwargs):
-                    self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
-                    self.assertTrue(kwargs["check"])
-                    self.assertEqual(kwargs["timeout"], 3600)
-                    kwargs["stdout"].write(f"stdout={secret}\nstderr={secret}\n")
-                    if outcome == "failure":
-                        raise subprocess.CalledProcessError(1, argv, output=secret, stderr=secret)
-                    if outcome == "timeout":
-                        raise subprocess.TimeoutExpired(argv, 3600, output=secret, stderr=secret)
-                    return subprocess.CompletedProcess(argv, 0)
+                    def run(argv, **kwargs):
+                        self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+                        self.assertTrue(kwargs["check"])
+                        self.assertEqual(kwargs["timeout"], 3600)
+                        kwargs["stdout"].write(f"stdout={secret}\nstderr={secret}\n")
+                        if outcome == "failure":
+                            raise subprocess.CalledProcessError(1, argv, output=secret, stderr=secret)
+                        if outcome == "timeout":
+                            raise subprocess.TimeoutExpired(argv, 3600, output=secret, stderr=secret)
+                        return subprocess.CompletedProcess(argv, 0)
 
-                with patch.object(EE.subprocess, "run", side_effect=run), \
-                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    if outcome == "success":
-                        self.assertEqual(EE.execute(["ansible-builder", "build"], cwd=source), "")
-                    else:
-                        with self.assertRaises(subprocess.SubprocessError):
-                            EE.execute(["ansible-builder", "build"], cwd=source)
-                self.assertIn(secret, (Path(directory) / "build.log").read_text())
-                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+                    with patch.object(EE.subprocess, "run", side_effect=run), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        if outcome == "success":
+                            self.assertEqual(EE.execute(command, cwd=source), "")
+                        else:
+                            with self.assertRaises(subprocess.SubprocessError):
+                                EE.execute(command, cwd=source)
+                    self.assertIn(secret, (Path(directory) / log_name).read_text())
+                    self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
     def test_raw_podman_output_is_captured_on_success_and_failure(self):
         secret = "synthetic-push-output-secret"
@@ -387,7 +392,8 @@ class SubprocessDiagnosticTests(unittest.TestCase):
                     f"::error::{secret}\r\n\x1b[31m{encoded}\x1b[0m")
         stages = (
             ("build", "source revision", lambda argv: argv[0] == "git"),
-            ("build", "EE build", lambda argv: argv[0] == "ansible-builder"),
+            ("build", "EE context generation", lambda argv: argv[0] == "ansible-builder"),
+            ("build", "EE build", lambda argv: argv[:2] == ["podman", "build"]),
             ("build", "built image inspection", lambda argv: "{{.ID}}" in argv),
             ("build", "installer verification", lambda argv: "openshift-install" in argv),
             ("build", "client verification", lambda argv: "oc" in argv),
@@ -440,35 +446,44 @@ class SubprocessDiagnosticTests(unittest.TestCase):
                         else:
                             self.assertNotIn("published_tags", json.loads(receipt.read_text()))
                         self.assertFalse(any(argv[:2] == ["podman", "push"] for argv in runner.commands))
+                        if operation == "EE context generation":
+                            self.assertFalse(any(argv[:2] == ["podman", "build"] for argv in runner.commands))
 
-    def test_real_execute_classifies_private_builder_log_tail_without_emitting_it(self):
+    def test_real_execute_classifies_each_private_stage_log_tail_without_emitting_it(self):
         secret = "synthetic-builder-log-credential"
         encoded = base64.b64encode(secret.encode()).decode()
-        for tail, category in (("no space left on device", "Storage space exhausted"),
-                               ("opaque build failure", "Unrecognized error")):
-            with self.subTest(category=category), tempfile.TemporaryDirectory() as directory:
-                source = Path(directory) / "source"
-                source.mkdir()
-                # An earlier transient message outside the bounded tail must not
-                # determine the final failure category.
-                payload = f"unauthorized\n{secret}\n" + "x" * 70000 + f"\n{tail}\n{encoded}"
+        for operation, command, log_name in (
+            ("EE context generation", ["ansible-builder", "create"], "builder.log"),
+            ("EE build", ["podman", "build"], "build.log"),
+        ):
+            for tail, category in (("no space left on device", "Storage space exhausted"),
+                                   ("opaque build failure", "Unrecognized error")):
+                with self.subTest(operation=operation, category=category), tempfile.TemporaryDirectory() as directory:
+                    source = Path(directory) / "source"
+                    source.mkdir()
+                    other_log = Path(directory) / ("build.log" if log_name == "builder.log" else "builder.log")
+                    other_log.write_text("unauthorized: " + secret)
+                    # Earlier messages outside the bounded tail and the other
+                    # stage's log must not determine the final failure category.
+                    payload = f"unauthorized\n{secret}\n" + "x" * 70000 + f"\n{tail}\n{encoded}"
 
-                def run(argv, **kwargs):
-                    kwargs["stdout"].write(payload)
-                    raise subprocess.CalledProcessError(2, [*argv, secret])
+                    def run(argv, **kwargs):
+                        kwargs["stdout"].write(payload)
+                        raise subprocess.CalledProcessError(2, [*argv, secret])
 
-                stdout, stderr = io.StringIO(), io.StringIO()
-                with patch.object(EE.subprocess, "run", side_effect=run), \
-                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
-                        self.assertRaises(EE.PublicError) as failure:
-                    EE.checked_operation("EE build", ["ansible-builder", "build"], cwd=source)
-                self.assertEqual(str(failure.exception),
-                    f"EE build: failed (exit code 2); {category}; original command output redacted")
-                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
-                self.assertEqual((Path(directory) / "build.log").read_text(), payload)
-                self.assertNotIn(secret, str(failure.exception))
-                self.assertNotIn(encoded, str(failure.exception))
-                self.assertTrue(failure.exception.__suppress_context__)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with patch.object(EE.subprocess, "run", side_effect=run), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                            self.assertRaises(EE.PublicError) as failure:
+                        EE.checked_operation(operation, command, cwd=source)
+                    self.assertEqual(str(failure.exception),
+                        f"{operation}: failed (exit code 2); {category}; original command output redacted")
+                    self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+                    self.assertEqual((Path(directory) / log_name).read_text(), payload)
+                    self.assertEqual(other_log.read_text(), "unauthorized: " + secret)
+                    self.assertNotIn(secret, str(failure.exception))
+                    self.assertNotIn(encoded, str(failure.exception))
+                    self.assertTrue(failure.exception.__suppress_context__)
 
     def test_missing_log_bytes_and_absent_output_remain_bounded(self):
         secret = b"synthetic-binary-credential"
@@ -481,7 +496,7 @@ class SubprocessDiagnosticTests(unittest.TestCase):
                 error = subprocess.CalledProcessError(-9, ["synthetic-private-argv"],
                                                      output=output, stderr=diagnostic)
                 with self.assertRaises(EE.PublicError) as failure:
-                    EE.checked_operation("EE build", ["ansible-builder", "build"],
+                    EE.checked_operation("EE build", ["podman", "build"],
                         run=unittest.mock.Mock(side_effect=error), cwd=Path(directory) / "source")
                 self.assertEqual(str(failure.exception), f"EE build: failed (exit code -9); {expected}")
 
@@ -642,12 +657,12 @@ class PRPreparationTests(unittest.TestCase):
 
     def test_explicit_digest_and_multiple_releases_share_one_base(self):
         config = EE.configuration()
-        config["pr_qualification"] = {"base_image": BASE, "versions": ["4.22.22", "5.0.0"]}
+        config["pr_qualification"] = {"base_image": BASE, "versions": ["4.22.22", "5.0.1"]}
         runner = Runner()
         with patch.object(EE, "configuration", return_value=config):
             plan = EE.prepare_pr(runner)
         self.assertEqual(plan["base"], BASE)
-        self.assertEqual([entry["release"] for entry in plan["matrix"]["include"]], ["4.22.22", "5.0.0"])
+        self.assertEqual([entry["release"] for entry in plan["matrix"]["include"]], ["4.22.22", "5.0.1"])
         self.assertEqual(sum(argv[:2] == ["podman", "pull"] for argv in runner.commands), 1)
 
     def test_invalid_qualification_settings_fail_before_pulling(self):
@@ -656,7 +671,7 @@ class PRPreparationTests(unittest.TestCase):
                    {**settings, "base_image": "docker.io/unknown/base:latest"}]
         invalid += [{**settings, "versions": versions} for versions in (
             [], "4.22.22", [None], ["stable-4.22"], ["4.23.1"],
-            ["4.22.22", "4.22.22"], ["4.22.22,5.0.0"]) ]
+            ["4.22.22", "4.22.22"], ["4.22.22,5.0.1"]) ]
         for value in invalid:
             with self.subTest(settings=value):
                 config = EE.configuration()
@@ -685,10 +700,15 @@ class BuildAndPublishTests(unittest.TestCase):
         self.assertEqual(record["base_image"], BASE)
         self.assertEqual(record["release_image"], PAYLOAD)
         self.assertEqual(set(record["archive_sha256"]), set(EE.ARCHIVES))
-        build = next(argv for argv in runner.commands if argv[0] == "ansible-builder")
-        self.assertIn("OCP_VERSION=4.22.22", build)
-        self.assertIn("EE_BASE_IMAGE=" + BASE, build)
-        self.assertIn("--extra-build-cli-args=--unsetlabel=quay.expires-after", build)
+        create = next(argv for argv in runner.commands if argv[0] == "ansible-builder")
+        context = self.output / "context"
+        self.assertEqual(create, ["ansible-builder", "create", "--verbosity=3", "--file",
+            "execution-environment.yml", "--output-filename", "Containerfile", "--context", str(context)])
+        build = next(argv for argv in runner.commands if argv[:2] == ["podman", "build"])
+        self.assertEqual(build, ["podman", "build", "--file", str(context / "Containerfile"),
+            "--tag", record["image"], "--build-arg", "OCP_VERSION=4.22.22", "--build-arg",
+            "EE_BASE_IMAGE=" + BASE, "--unsetlabel=quay.expires-after", str(context)])
+        self.assertLess(runner.commands.index(create), runner.commands.index(build))
         self.assertFalse(any(argv[:2] == ["podman", "push"] for argv in runner.commands))
         with self.assertRaises(FileExistsError):
             self.build()
@@ -746,7 +766,7 @@ class BuildAndPublishTests(unittest.TestCase):
         self.assertEqual(result["published_image"], "quay.io/s4v0/" + EE.image_name("4.22.22") + "@" + DIGEST)
 
     def test_cross_stream_builds_and_publication_use_matching_repositories(self):
-        for version in ("4.22.14", "5.0.0"):
+        for version in ("4.22.14", "5.0.1"):
             with self.subTest(version=version):
                 runner = Runner(version=version, client=version)
                 receipt = EE.build(version, BASE, COMMIT, "123-1",
@@ -771,8 +791,8 @@ class BuildAndPublishTests(unittest.TestCase):
         config_path = workspace / "streams.json"
         config_path.write_text(json.dumps(config))
         with patch.object(EE, "ROOT", workspace), patch.object(EE, "CONFIG", config_path):
-            receipt = EE.build("5.0.0", BASE, COMMIT, "123-1", self.output,
-                               run=Runner(version="5.0.0", client="5.0.0"), opener=Mirror(version="5.0.0"))
+            receipt = EE.build("5.0.1", BASE, COMMIT, "123-1", self.output,
+                               run=Runner(version="5.0.1", client="5.0.1"), opener=Mirror(version="5.0.1"))
         record = json.loads(receipt.read_text())
         self.assertEqual(record["definition"], definition)
         self.assertTrue(record["image"].startswith("localhost/dcm-ocp-ee-5.0:"))
@@ -782,7 +802,7 @@ class BuildAndPublishTests(unittest.TestCase):
     def test_receipt_cannot_cross_stream_or_repository_boundaries(self):
         receipt, _ = self.build()
         original = json.loads(receipt.read_text())
-        for key, value in (("stream", "5.0"), ("image", "localhost/dcm-ocp-ee-5.0:0")):
+        for key, value in (("stream", "5.0"), ("image", "localhost/dcm-ocp-ee-5.0:1")):
             record = dict(original)
             record[key] = value
             receipt.write_text(json.dumps(record))
@@ -847,7 +867,7 @@ class BuildAndPublishTests(unittest.TestCase):
         release = plan["matrix"]["include"][0]["release"]
         receipt = EE.build(release, plan["base"], COMMIT, "123-1", self.output,
                            pr="64", run=runner, opener=Mirror())
-        build = next(argv for argv in runner.commands if argv[0] == "ansible-builder")
+        build = next(argv for argv in runner.commands if argv[:2] == ["podman", "build"])
         self.assertIn("EE_BASE_IMAGE=" + BASE, build)
         pulls = [argv[-1] for argv in runner.commands if argv[:2] == ["podman", "pull"]]
         self.assertEqual(pulls, ["quay.io/s4v0/dcm-base-ee:latest", BASE])
@@ -859,6 +879,7 @@ class BuildAndPublishTests(unittest.TestCase):
         self.assertEqual(result["published_tags"], [
             "ghcr.io/heatmiser/dcm-ocp-ee-4.22:22-pr-64-aaaaaaaaaaaa-123-1"])
         self.assertEqual(sum(argv[0] == "ansible-builder" for argv in runner.commands), 1)
+        self.assertEqual(sum(argv[:2] == ["podman", "build"] for argv in runner.commands), 1)
 
     def test_wrong_version_at_publication_cannot_push(self):
         receipt, _ = self.build()
@@ -890,17 +911,24 @@ class BuildAndPublishTests(unittest.TestCase):
             if os.environ.get("REQUIRE_BUILDER") == "1":
                 self.fail("CI requires the pinned ansible-builder")
             self.skipTest("ansible-builder not installed; CI requires this render check")
-        for version in ("4.22.22", "4.22.14", "5.0.0"):
+        for version in ("4.22.22", "4.22.14", "5.0.1"):
             with self.subTest(version=version):
                 output = Path(self.temporary.name) / version
+                runner = Runner(version=version, client=version)
+
+                def run(argv, cwd=None):
+                    if argv[0] == "ansible-builder":
+                        self.assertEqual(argv[1], "create")
+                        return EE.execute(argv, cwd=cwd)
+                    if argv[:2] == ["podman", "build"]:
+                        self.assertEqual(cwd, output / "context")
+                        self.assertTrue((cwd / "Containerfile").is_file())
+                        self.assertEqual(Path(argv[argv.index("--file") + 1]), cwd / "Containerfile")
+                    return runner(argv, cwd)
+
                 EE.build(version, BASE, COMMIT, "123-1", output,
-                         run=Runner(version=version, client=version), opener=Mirror(version=version))
-                result = subprocess.run(["ansible-builder", "create", "--file", "execution-environment.yml",
-                                         "--output-filename", "Containerfile",
-                                         "--context", str(output / "rendered"), "--verbosity=3"],
-                                        cwd=output / "source", capture_output=True, text=True, timeout=60)
-                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                containerfile = (output / "rendered/Containerfile").read_text()
+                         run=run, opener=Mirror(version=version))
+                containerfile = (output / "context/Containerfile").read_text()
                 self.assertIn("ARG OCP_VERSION", containerfile)
                 self.assertIn("RUN --mount=type=bind,source=_build/ocp-release,target=/tmp/ocp-release,ro ", containerfile)
                 self.assertNotIn("COPY _build/ocp-release", containerfile)
@@ -908,7 +936,7 @@ class BuildAndPublishTests(unittest.TestCase):
                 self.assertIn("sha256sum -c SHA256SUMS && tar xzf openshift-client-linux.tar.gz", containerfile)
                 self.assertIn('LABEL ocp.version="$OCP_VERSION"', containerfile)
                 for name in (*EE.ARCHIVES, "SHA256SUMS"):
-                    self.assertTrue((output / "rendered/_build/ocp-release" / name).is_file())
+                    self.assertTrue((output / "context/_build/ocp-release" / name).is_file())
 
 
 class WorkflowTests(unittest.TestCase):

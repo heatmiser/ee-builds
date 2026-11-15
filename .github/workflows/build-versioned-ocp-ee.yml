@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Comma-separated exact releases from configured streams, e.g. 4.22.22,5.0.0"
+        description: "Comma-separated exact releases from configured streams, e.g. 4.22.22,5.0.1"
         required: true
         default: "4.22.22"
         type: string
