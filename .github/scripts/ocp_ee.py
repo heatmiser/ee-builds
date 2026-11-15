@@ -218,6 +218,46 @@ def base_diagnostic(stderr):
     return "; ".join(matched or ["Unrecognized error"]) + "; original stderr redacted"
 
 
+def checked_operation(operation, argv, run=execute, cwd=None):
+    """Expose fixed stage/reason labels, never argv, paths or exception text."""
+    require(operation in {
+        "source revision", "EE build", "built image inspection", "installer verification",
+        "client verification", "image label inspection", "publication installer verification",
+        "publication client verification", "image push",
+    }, "Unsupported subprocess operation")
+    try:
+        return run(argv, cwd=cwd)
+    except (OSError, subprocess.SubprocessError) as error:
+        if isinstance(error, subprocess.TimeoutExpired):
+            status, diagnostic = "timed out", "Operation timed out"
+        elif isinstance(error, OSError):
+            code = error.errno if type(error.errno) is int else "unavailable"
+            status, diagnostic = f"failed (OS error code {code})", "Subprocess could not execute"
+        elif isinstance(error, subprocess.CalledProcessError):
+            code = error.returncode if type(error.returncode) is int else "unavailable"
+            status = f"failed (exit code {code})"
+            # The real Builder redirects both streams to this private file. Read
+            # only its tail, after execute() has closed/flushed it. Never emit it.
+            captured = []
+            if operation == "EE build" and cwd is not None:
+                try:
+                    with (Path(cwd).parent / "build.log").open("rb") as log:
+                        log.seek(0, os.SEEK_END)
+                        log.seek(max(0, log.tell() - 65536))
+                        captured.append(log.read(65536).decode("utf-8", errors="replace"))
+                except OSError:
+                    pass
+            for value in (error.stdout, error.stderr):
+                if isinstance(value, bytes):
+                    captured.append(value[-65536:].decode("utf-8", errors="replace"))
+                elif isinstance(value, str):
+                    captured.append(value[-65536:])
+            diagnostic = base_diagnostic("\n".join(captured)).replace("stderr", "command output")
+        else:
+            status, diagnostic = "failed", "Unrecognized subprocess error"
+        raise PublicError(f"{operation}: {status}; {diagnostic}") from None
+
+
 def pinned_base(reference, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee(?::[A-Za-z0-9_.-]+|@sha256:[a-f0-9]{64})",
                          reference), "Require a Quay/GHCR dcm-base-ee reference")
@@ -335,7 +375,7 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
     settings = stream_settings(stream)
     image = image_name(version)
     tags = image_tags(version, selection, commit, run_id, pr)
-    require(run(["git", "rev-parse", "HEAD"], cwd=ROOT).strip() == commit,
+    require(checked_operation("source revision", ["git", "rev-parse", "HEAD"], run, cwd=ROOT).strip() == commit,
             "Source checkout differs from requested commit")
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -345,16 +385,20 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
     base_digest = pinned_base(base, run)
     local_image = f"localhost/{image}:{tags[0]}"
     # --unsetlabel also removes the expiry inherited from dcm-base-ee.
-    run(["ansible-builder", "build", "--container-runtime=podman", "--verbosity=3",
+    checked_operation("EE build", ["ansible-builder", "build", "--container-runtime=podman", "--verbosity=3",
          "--file", "execution-environment.yml", "--context", str(output / "context"),
          "--tag", local_image, "--build-arg", f"OCP_VERSION={version}",
          "--build-arg", f"EE_BASE_IMAGE={base_digest}",
-         "--extra-build-cli-args=--unsetlabel=quay.expires-after"], cwd=source)
-    image_id = normalize_image_id(run(["podman", "image", "inspect", "--format", "{{.ID}}", local_image]).strip())
-    installer = run(["podman", "run", "--rm", "--pull=never", image_id, "openshift-install", "version"])
-    client = run(["podman", "run", "--rm", "--pull=never", image_id, "oc", "version", "--client"])
+         "--extra-build-cli-args=--unsetlabel=quay.expires-after"], run, cwd=source)
+    image_id = normalize_image_id(checked_operation("built image inspection",
+        ["podman", "image", "inspect", "--format", "{{.ID}}", local_image], run).strip())
+    installer = checked_operation("installer verification",
+        ["podman", "run", "--rm", "--pull=never", image_id, "openshift-install", "version"], run)
+    client = checked_operation("client verification",
+        ["podman", "run", "--rm", "--pull=never", image_id, "oc", "version", "--client"], run)
     payload = verify_tools(version, installer, client)
-    labels = json.loads(run(["podman", "image", "inspect", "--format", "{{json .Config.Labels}}", image_id]))
+    labels = json.loads(checked_operation("image label inspection",
+        ["podman", "image", "inspect", "--format", "{{json .Config.Labels}}", image_id], run))
     require(not labels.get("quay.expires-after") and labels.get("ocp.version") == version,
             "Final release image must record its version and have no expiry label")
     record = {"schema_version": 2, "verified": True, "selection": selection, "release": version,
@@ -376,15 +420,18 @@ def publish(receipt, registry, run=execute):
     require(bool(record["pr"]) == registry.startswith("ghcr.io/"), "PR builds publish only to GHCR; releases only to Quay")
     record["image_id"] = normalize_image_id(record["image_id"])
     # Recheck immutable local content before any tag can reach a registry.
-    installer = run(["podman", "run", "--rm", "--pull=never", record["image_id"], "openshift-install", "version"])
-    client = run(["podman", "run", "--rm", "--pull=never", record["image_id"], "oc", "version", "--client"])
+    installer = checked_operation("publication installer verification",
+        ["podman", "run", "--rm", "--pull=never", record["image_id"], "openshift-install", "version"], run)
+    client = checked_operation("publication client verification",
+        ["podman", "run", "--rm", "--pull=never", record["image_id"], "oc", "version", "--client"], run)
     require(verify_tools(record["release"], installer, client) == record["release_image"], "Release payload changed")
     destinations, expected_digest = [], None
     for index, tag in enumerate(record["tags"]):
         destination = f"{registry}/{image}:{tag}"
         digestfile = receipt.parent / f"push-{index}.digest"
         require(not digestfile.exists(), "Push evidence already exists; inspect the previous publication")
-        run(["podman", "push", "--digestfile", str(digestfile), record["image_id"], f"docker://{destination}"])
+        checked_operation("image push",
+            ["podman", "push", "--digestfile", str(digestfile), record["image_id"], f"docker://{destination}"], run)
         digest = digestfile.read_text().strip()
         require(re.fullmatch(r"sha256:[a-f0-9]{64}", digest), "Registry returned an invalid digest")
         require(expected_digest in (None, digest), "Published tag digests differ")

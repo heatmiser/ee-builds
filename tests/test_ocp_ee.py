@@ -377,6 +377,150 @@ class PublicOutputTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
 
+class SubprocessDiagnosticTests(unittest.TestCase):
+    def test_build_and_publish_cli_identify_each_failed_operation_without_secrets(self):
+        secret = "synthetic-stage-password:/+$"
+        encoded = base64.b64encode(secret.encode()).decode()
+        payloads = (f"Authorization: Bearer {secret}",
+                    json.dumps({"auth": encoded}),
+                    f"https://synthetic-user:{secret}@registry.invalid/?token={encoded}",
+                    f"::error::{secret}\r\n\x1b[31m{encoded}\x1b[0m")
+        stages = (
+            ("build", "source revision", lambda argv: argv[0] == "git"),
+            ("build", "EE build", lambda argv: argv[0] == "ansible-builder"),
+            ("build", "built image inspection", lambda argv: "{{.ID}}" in argv),
+            ("build", "installer verification", lambda argv: "openshift-install" in argv),
+            ("build", "client verification", lambda argv: "oc" in argv),
+            ("build", "image label inspection", lambda argv: "{{json .Config.Labels}}" in argv),
+            ("publish", "publication installer verification", lambda argv: "openshift-install" in argv),
+            ("publish", "publication client verification", lambda argv: "oc" in argv),
+            ("publish", "image push", lambda argv: argv[:2] == ["podman", "push"]),
+        )
+        build, publish = EE.build, EE.publish
+        for command, operation, matches in stages:
+            for prefix, category in (("unauthorized: ", "Registry authentication failed"),
+                                     ("opaque failure: ", "Unrecognized error")):
+                for payload in payloads:
+                    with self.subTest(operation=operation, category=category, payload=payloads.index(payload)), \
+                            tempfile.TemporaryDirectory() as directory:
+                        output = Path(directory) / "build"
+                        receipt = output / "receipt.json"
+                        if command == "publish":
+                            build("4.22.22", BASE, COMMIT, "123-1", output, pr="64",
+                                  run=Runner(), opener=Mirror())
+                        runner = Runner()
+
+                        def run(argv, cwd=None):
+                            if matches(argv):
+                                raise subprocess.CalledProcessError(125, [*argv, payload],
+                                    output=payload, stderr=prefix + payload)
+                            return runner(argv, cwd)
+
+                        action = (lambda *args: build(*args, run=run, opener=Mirror())) if command == "build" \
+                            else (lambda *args: publish(*args, run=run))
+                        arguments = (["--release", "4.22.22", "--base", BASE, "--commit", COMMIT,
+                                      "--run-id", "123-1", "--output", str(output), "--pr", "64"]
+                                     if command == "build" else
+                                     ["--receipt", str(receipt), "--registry", "ghcr.io/heatmiser"])
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with patch("sys.argv", ["ocp_ee.py", command, *arguments]), \
+                                patch.object(EE, command, side_effect=action), \
+                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                                self.assertRaises(SystemExit) as failure:
+                            EE.main()
+                        self.assertEqual(failure.exception.code, 1)
+                        self.assertEqual(stdout.getvalue(), "")
+                        self.assertEqual(stderr.getvalue(),
+                            f"ERROR: OCP EE {command} failed: {operation}: failed (exit code 125); "
+                            f"{category}; original command output redacted; preserve build evidence.\n")
+                        for private in (secret, encoded, payload, str(output), "synthetic-user"):
+                            self.assertNotIn(private, stderr.getvalue())
+                        if command == "build":
+                            self.assertFalse(receipt.exists())
+                        else:
+                            self.assertNotIn("published_tags", json.loads(receipt.read_text()))
+                        self.assertFalse(any(argv[:2] == ["podman", "push"] for argv in runner.commands))
+
+    def test_real_execute_classifies_private_builder_log_tail_without_emitting_it(self):
+        secret = "synthetic-builder-log-credential"
+        encoded = base64.b64encode(secret.encode()).decode()
+        for tail, category in (("no space left on device", "Storage space exhausted"),
+                               ("opaque build failure", "Unrecognized error")):
+            with self.subTest(category=category), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "source"
+                source.mkdir()
+                # An earlier transient message outside the bounded tail must not
+                # determine the final failure category.
+                payload = f"unauthorized\n{secret}\n" + "x" * 70000 + f"\n{tail}\n{encoded}"
+
+                def run(argv, **kwargs):
+                    kwargs["stdout"].write(payload)
+                    raise subprocess.CalledProcessError(2, [*argv, secret])
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(EE.subprocess, "run", side_effect=run), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                        self.assertRaises(EE.PublicError) as failure:
+                    EE.checked_operation("EE build", ["ansible-builder", "build"], cwd=source)
+                self.assertEqual(str(failure.exception),
+                    f"EE build: failed (exit code 2); {category}; original command output redacted")
+                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+                self.assertEqual((Path(directory) / "build.log").read_text(), payload)
+                self.assertNotIn(secret, str(failure.exception))
+                self.assertNotIn(encoded, str(failure.exception))
+                self.assertTrue(failure.exception.__suppress_context__)
+
+    def test_missing_log_bytes_and_absent_output_remain_bounded(self):
+        secret = b"synthetic-binary-credential"
+        for output, diagnostic, expected in (
+            (None, None, "No command output captured"),
+            (b"\xff" + secret, b"x509: " + secret, "TLS or certificate failure; original command output redacted"),
+            ("unauthorized" + "x" * 70000, secret, "Unrecognized error; original command output redacted"),
+        ):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                error = subprocess.CalledProcessError(-9, ["synthetic-private-argv"],
+                                                     output=output, stderr=diagnostic)
+                with self.assertRaises(EE.PublicError) as failure:
+                    EE.checked_operation("EE build", ["ansible-builder", "build"],
+                        run=unittest.mock.Mock(side_effect=error), cwd=Path(directory) / "source")
+                self.assertEqual(str(failure.exception), f"EE build: failed (exit code -9); {expected}")
+
+    def test_timeout_os_and_other_subprocess_errors_have_fixed_cli_messages(self):
+        secret = "synthetic-exception-credential"
+        errors = (
+            (subprocess.TimeoutExpired([secret], 3600, output=secret, stderr=secret),
+             "timed out; Operation timed out"),
+            (FileNotFoundError(2, secret, secret), "failed (OS error code 2); Subprocess could not execute"),
+            (OSError(secret), "failed (OS error code unavailable); Subprocess could not execute"),
+            (subprocess.SubprocessError(secret), "failed; Unrecognized subprocess error"),
+            (subprocess.CalledProcessError(secret, [secret], output=secret, stderr=secret),
+             "failed (exit code unavailable); Unrecognized error; original command output redacted"),
+        )
+        for error, expected in errors:
+            with self.subTest(error=type(error).__name__):
+                def action(*args):
+                    return EE.checked_operation("EE build", [secret],
+                        run=unittest.mock.Mock(side_effect=error))
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch("sys.argv", ["ocp_ee.py", "build", "--release", "4.22.22", "--base", BASE,
+                                        "--commit", COMMIT, "--run-id", "123-1", "--output", "/unused"]), \
+                        patch.object(EE, "build", side_effect=action), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                        self.assertRaises(SystemExit):
+                    EE.main()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(),
+                    f"ERROR: OCP EE build failed: EE build: {expected}; preserve build evidence.\n")
+                self.assertNotIn(secret, stderr.getvalue())
+
+    def test_unapproved_operation_labels_cannot_be_echoed_or_run(self):
+        runner = unittest.mock.Mock()
+        with self.assertRaisesRegex(EE.PublicError, "^Unsupported subprocess operation$"):
+            EE.checked_operation("synthetic-secret-label", ["synthetic-private-argv"], run=runner)
+        runner.assert_not_called()
+
+
 class PRPreparationTests(unittest.TestCase):
     def test_base_failures_reach_cli_with_operation_exit_code_and_safe_reason(self):
         for operation, code, diagnostic, expected in (
@@ -729,7 +873,7 @@ class BuildAndPublishTests(unittest.TestCase):
             if argv[:2] == ["podman", "push"] and argv[-1].endswith(":22"):
                 raise subprocess.CalledProcessError(1, argv)
             return runner(argv, cwd)
-        with self.assertRaises(subprocess.CalledProcessError):
+        with self.assertRaisesRegex(EE.PublicError, "image push: failed \\(exit code 1\\)"):
             EE.publish(receipt, "quay.io/s4v0", fail_alias)
         self.assertEqual(len(json.loads(receipt.read_text())["published_tags"]), 1)
 
