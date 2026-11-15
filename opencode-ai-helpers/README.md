@@ -14,8 +14,9 @@ lives in the
 | File | Purpose |
 |------|---------|
 | `Containerfile` | Image definition — UBI 10 base, tooling layer, pinned OpenCode v2 install |
-| `opencode-entrypoint.sh` | Container entrypoint — passthrough to `opencode` |
+| `opencode-entrypoint.sh` | Container entrypoint — installs baked skills into the mounted config, then passthrough to `opencode` |
 | `image.yaml` | Per-image metadata used by CI workflows |
+| `skills/` | Baked skills (e.g. `skill-manager`) staged to `/opt/opencode-builtin-skills/` and installed into the mounted OpenCode config on startup |
 
 ## Building locally
 

@@ -119,6 +119,8 @@ ARG OPENCODE_VERSION=2.0.28
 RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" \
     && opencode --version
 
+COPY skills/ /opt/opencode-builtin-skills/
+
 COPY opencode-entrypoint.sh /usr/local/sbin/opencode-entrypoint.sh
 RUN chmod +x /usr/local/sbin/opencode-entrypoint.sh
 
