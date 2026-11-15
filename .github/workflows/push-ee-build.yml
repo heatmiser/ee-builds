@@ -46,8 +46,14 @@ jobs:
     - name: Generate matrix (workflow_dispatch)
       if: github.event_name == 'workflow_dispatch'
       working-directory: ${{ github.workspace }}
+      env:
+        EE_NAME: ${{ inputs.ee_name }}
       run: |
-        echo '{"include":[{"ee":"${{ inputs.ee_name }}"}]}' > matrix_output.json
+        if [ "$EE_NAME" = dcm-ocp-ee-4.22 ]; then
+          echo "Use Versioned OpenShift 4.22 EE Build for this image." >&2
+          exit 1
+        fi
+        python3 -c 'import json, os; print(json.dumps({"include": [{"ee": os.environ["EE_NAME"]}]}))' > matrix_output.json
 
     - name: Read matrix
       id: set-matrix
@@ -186,6 +192,9 @@ jobs:
     if: needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
     runs-on: ubuntu-latest
     environment: deploy
+    concurrency:
+      group: ocp-ee-${{ matrix.ocp_version }}-production
+      cancel-in-progress: false
     strategy:
       matrix:
         ocp_version: ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21', '4.22']
@@ -227,6 +236,7 @@ jobs:
         run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
 
       - name: Build image
+        if: matrix.ocp_version != '4.22'
         working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
         run: |
           ansible-builder build -v 3 \
@@ -235,7 +245,38 @@ jobs:
           --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
           --tag=${{ env.EE }}:${{ github.sha }}
 
+      - name: Build and verify exact stable OpenShift 4.22 release
+        if: matrix.ocp_version == '4.22'
+        env:
+          OCP_BASE: quay.io/${{ secrets.QUAY_USERNAME }}/dcm-base-ee:latest
+          SOURCE_COMMIT: ${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 .github/scripts/ocp_ee.py build \
+            --release stable-4.22 --base "$OCP_BASE" \
+            --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" \
+            --output "$RUNNER_TEMP/ocp-ee-4.22"
+
+      - name: Publish verified OpenShift 4.22 image
+        if: matrix.ocp_version == '4.22'
+        env:
+          OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
+        run: |
+          python3 .github/scripts/ocp_ee.py publish \
+            --receipt "$RUNNER_TEMP/ocp-ee-4.22/receipt.json" --registry "$OCP_REGISTRY"
+
+      - name: Preserve OpenShift 4.22 build receipt
+        if: always() && matrix.ocp_version == '4.22'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocp-ee-4.22-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ocp-ee-4.22/receipt.json
+            ${{ runner.temp }}/ocp-ee-4.22/build.log
+          if-no-files-found: ignore
+
       - name: Push To quay.io
+        if: matrix.ocp_version != '4.22'
         uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
         with:
           image: ${{ env.EE }}
@@ -245,6 +286,7 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
 
       - name: Print summary
+        if: matrix.ocp_version != '4.22'
         run: |
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY

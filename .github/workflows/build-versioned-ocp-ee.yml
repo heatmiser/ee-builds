@@ -1,0 +1,115 @@
+---
+name: Versioned OpenShift 4.22 EE Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: "Comma-separated exact releases, e.g. 4.22.14,4.22.22"
+        required: true
+        default: "4.22.22"
+        type: string
+      base_image:
+        description: "Published dcm-base-ee tag or digest; resolved once for the entire matrix"
+        required: true
+        default: "quay.io/s4v0/dcm-base-ee:latest"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    environment: deploy
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      base: ${{ steps.prepare.outputs.base }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate exact releases
+        env:
+          VERSIONS: ${{ inputs.versions }}
+        run: python3 .github/scripts/ocp_ee.py matrix --versions "$VERSIONS"
+
+      - name: Log in to Quay
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Resolve one base digest and prepare matrix
+        id: prepare
+        env:
+          VERSIONS: ${{ inputs.versions }}
+          BASE_IMAGE: ${{ inputs.base_image }}
+        run: |
+          MATRIX=$(python3 .github/scripts/ocp_ee.py matrix --versions "$VERSIONS")
+          BASE=$(python3 .github/scripts/ocp_ee.py resolve-base --reference "$BASE_IMAGE")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: deploy
+    concurrency:
+      group: ocp-ee-4.22-production
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Ansible Builder
+        run: pip install -r requirements.txt
+
+      - name: Log in to Quay
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Log in to Red Hat registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: registry.redhat.io
+          username: ${{ secrets.REDHAT_USERNAME }}
+          password: ${{ secrets.REDHAT_PASSWORD }}
+
+      - name: Build and verify selected release
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+          OCP_BASE: ${{ needs.prepare.outputs.base }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python3 .github/scripts/ocp_ee.py build \
+            --release "$OCP_RELEASE" --base "$OCP_BASE" \
+            --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" \
+            --output "$RUNNER_TEMP/ocp-ee-4.22"
+
+      - name: Publish patch and build tags
+        env:
+          OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
+        run: |
+          python3 .github/scripts/ocp_ee.py publish \
+            --receipt "$RUNNER_TEMP/ocp-ee-4.22/receipt.json" --registry "$OCP_REGISTRY"
+
+      - name: Preserve build receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocp-ee-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ocp-ee-4.22/receipt.json
+            ${{ runner.temp }}/ocp-ee-4.22/build.log
+          if-no-files-found: ignore
+...
