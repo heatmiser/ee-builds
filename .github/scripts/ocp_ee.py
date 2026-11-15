@@ -172,11 +172,63 @@ def execute(argv, cwd=None):
     return subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True, timeout=3600).stdout
 
 
+def registry_login(registry):
+    """Authenticate without putting passwords in argv or publishing tool output."""
+    require(registry in ("quay.io", "ghcr.io"), "Unsupported registry login target")
+    environment = dict(os.environ)
+    username = environment.pop("REGISTRY_USERNAME", "")
+    password = environment.pop("REGISTRY_PASSWORD", "")
+    require(bool(username) and bool(password), "Registry login credentials missing")
+    try:
+        subprocess.run(["podman", "login", "--username", username, "--password-stdin", registry],
+                       input=password + "\n", text=True, capture_output=True, check=True,
+                       timeout=120, env=environment)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # Even exception strings may include credentials or captured tool output.
+        raise ValueError(f"Registry login failed for {registry}; command output suppressed") from None
+
+
+def base_diagnostic(stderr):
+    """Redact arbitrary stderr, returning only fixed, allowlisted error reasons.
+
+    Substitution-based masking cannot cover unknown credentials or encodings.
+    Never interpolate original stderr, even when a recognized reason is present.
+    """
+    if not stderr or not stderr.strip():
+        return "No stderr captured"
+    lowered = stderr.lower()
+    reasons = (
+        (("unauthorized", "authentication required", "invalid username/password"), "Registry authentication failed"),
+        (("access denied", "requested access", "permission denied", "forbidden"), "Access denied"),
+        (("manifest unknown", "manifest not found", "name unknown"), "Image or manifest not found"),
+        (("image not known", "no such image"), "Local image not found"),
+        (("x509:", "tls handshake", "certificate verify failed"), "TLS or certificate failure"),
+        (("no such host", "name resolution"), "DNS resolution failed"),
+        (("timeout", "timed out", "deadline exceeded"), "Operation timed out"),
+        (("connection refused", "connection reset", "network is unreachable"), "Network connection failed"),
+        (("no space left on device", "disk quota exceeded"), "Storage space exhausted"),
+        (("too many requests", "rate limit", "toomanyrequests"), "Registry rate limit reached"),
+    )
+    matched = [reason for markers, reason in reasons if any(marker in lowered for marker in markers)]
+    return "; ".join(matched or ["Unrecognized error"]) + "; original stderr redacted"
+
+
 def pinned_base(reference, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee(?::[A-Za-z0-9_.-]+|@sha256:[a-f0-9]{64})",
                          reference), "Require a Quay/GHCR dcm-base-ee reference")
-    run(["podman", "pull", "--quiet", reference])
-    digests = json.loads(run(["podman", "image", "inspect", "--format", "{{json .RepoDigests}}", reference]))
+    # Only fixed classifications of these base-resolution failures are exposed.
+    # Other commands retain the CLI's restricted error output.
+    for operation, argv in (
+        ("pull", ["podman", "pull", "--quiet", reference]),
+        ("inspect", ["podman", "image", "inspect", "--format", "{{json .RepoDigests}}", reference]),
+    ):
+        try:
+            result = run(argv)
+        except subprocess.CalledProcessError as error:
+            diagnostic = base_diagnostic(error.stderr)
+            raise ValueError(f"Base image {operation} failed (exit code {error.returncode})"
+                             f" for {reference}\nPodman: {diagnostic}") from None
+    digests = json.loads(result)
     repository = reference.split("@", 1)[0].split(":", 1)[0]
     candidates = [item for item in digests if re.fullmatch(re.escape(repository) + r"@sha256:[a-f0-9]{64}", item)]
     require(bool(candidates), "Base image has no matching repository digest")
@@ -299,6 +351,8 @@ def main():
     matrix.add_argument("--versions", required=True)
     commands.add_parser("automation-matrix")
     commands.add_parser("prepare-pr")
+    login = commands.add_parser("registry-login")
+    login.add_argument("--registry", required=True, choices=("quay.io", "ghcr.io"))
     base = commands.add_parser("resolve-base")
     base.add_argument("--reference", required=True)
     builder = commands.add_parser("build")
@@ -317,6 +371,9 @@ def main():
             print(json.dumps(automation_matrix()))
         elif args.command == "prepare-pr":
             print(json.dumps(prepare_pr()))
+        elif args.command == "registry-login":
+            registry_login(args.registry)
+            print(f"Registry login succeeded for {args.registry}")
         elif args.command == "resolve-base":
             print(pinned_base(args.reference))
         elif args.command == "build":

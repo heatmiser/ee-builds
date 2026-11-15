@@ -1,6 +1,7 @@
 """Offline contract tests: no mirror, registry, container build or publication."""
 
 import contextlib
+import base64
 import hashlib
 import importlib.util
 import io
@@ -210,7 +211,197 @@ class VersionSelectionTests(unittest.TestCase):
                 EE.verify_tools("4.22.22", tool, client)
 
 
+class RegistryLoginTests(unittest.TestCase):
+    def test_cli_login_suppresses_synthetic_secrets_on_success_and_failure(self):
+        username, password = "synthetic-login-user", "synthetic-login-password:/+$"
+        encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+        messages = (
+            f"username={username} password={password}",
+            f"Authorization: Basic {encoded}\nAuthorization: Bearer {password}",
+            f"https://{username}:{password}@registry.invalid/\n::error::{encoded}",
+            json.dumps({"auth": encoded, "identitytoken": password}),
+            f"{username}\n{password}\n{encoded}\r\n\x1b[31m{password}\x1b[0m",
+        )
+        for registry in ("quay.io", "ghcr.io"):
+            for success in (True, False):
+                for index, message in enumerate(messages):
+                    with self.subTest(registry=registry, success=success, payload=index):
+                        stdout, stderr = io.StringIO(), io.StringIO()
+
+                        def run(argv, **kwargs):
+                            self.assertEqual(argv, ["podman", "login", "--username", username,
+                                                    "--password-stdin", registry])
+                            self.assertNotIn(password, argv)
+                            self.assertEqual(kwargs["input"], password + "\n")
+                            self.assertTrue(kwargs["capture_output"])
+                            self.assertTrue(kwargs["check"])
+                            self.assertEqual(kwargs["timeout"], 120)
+                            self.assertNotIn("REGISTRY_USERNAME", kwargs["env"])
+                            self.assertNotIn("REGISTRY_PASSWORD", kwargs["env"])
+                            if not success:
+                                raise subprocess.CalledProcessError(125, argv, output=message, stderr=message)
+                            return subprocess.CompletedProcess(argv, 0, stdout=message, stderr=message)
+
+                        with patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
+                                patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", registry]), \
+                                patch.object(EE.subprocess, "run", side_effect=run), \
+                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                            if success:
+                                EE.main()
+                            else:
+                                with self.assertRaises(SystemExit) as error:
+                                    EE.main()
+                                self.assertEqual(error.exception.code, 1)
+                        if success:
+                            self.assertEqual(stdout.getvalue(), f"Registry login succeeded for {registry}\n")
+                            self.assertEqual(stderr.getvalue(), "")
+                        else:
+                            self.assertEqual(stdout.getvalue(), "")
+                            self.assertEqual(stderr.getvalue(),
+                                             f"ERROR: OCP EE registry-login failed: Registry login failed for {registry}; "
+                                             "command output suppressed; preserve build evidence.\n")
+                        for secret in (username, password, encoded):
+                            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
+    def test_login_runtime_exceptions_do_not_expose_credentials(self):
+        secret = "synthetic-exception-secret"
+        errors = (OSError(secret), ValueError(secret),
+                  subprocess.TimeoutExpired(["podman", "login", secret], 120, output=secret, stderr=secret))
+        for error in errors:
+            with self.subTest(error=type(error).__name__), \
+                    patch.dict(os.environ, REGISTRY_USERNAME="synthetic-user", REGISTRY_PASSWORD=secret), \
+                    patch.object(EE.subprocess, "run", side_effect=error), \
+                    self.assertRaises(ValueError) as failure:
+                EE.registry_login("quay.io")
+            self.assertEqual(str(failure.exception),
+                             "Registry login failed for quay.io; command output suppressed")
+            self.assertIsNone(failure.exception.__cause__)
+            self.assertTrue(failure.exception.__suppress_context__)
+
+    def test_missing_credentials_and_unapproved_registries_fail_before_podman(self):
+        for username, password in (("", ""), ("user", ""), ("", "password")):
+            with self.subTest(username_present=bool(username), password_present=bool(password)), \
+                    patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
+                    patch.object(EE.subprocess, "run") as run, \
+                    self.assertRaisesRegex(ValueError, "Registry login credentials missing"):
+                EE.registry_login("quay.io")
+            run.assert_not_called()
+        with patch.object(EE.subprocess, "run") as run, \
+                self.assertRaisesRegex(ValueError, "Unsupported registry login target"):
+            username, password = "user", "password"
+            EE.registry_login(f"https://{username}:{password}@unknown.invalid")
+        run.assert_not_called()
+
+
 class PRPreparationTests(unittest.TestCase):
+    def test_base_failures_reach_cli_with_operation_exit_code_and_safe_reason(self):
+        for operation, code, diagnostic, expected in (
+            ("pull", 125, "Error: registry access denied\n::warning::registry detail", "Access denied"),
+            ("inspect", 1, "Error: image not known", "Local image not found"),
+            ("inspect", 125, None, "No stderr captured"),
+        ):
+            with self.subTest(operation=operation, stderr=diagnostic):
+                commands = []
+
+                def run(argv, **kwargs):
+                    commands.append(argv)
+                    if argv[1] == operation or operation == "inspect" and argv[1:3] == ["image", "inspect"]:
+                        raise subprocess.CalledProcessError(code, argv, output="private stdout",
+                                                            stderr=diagnostic)
+                    return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch("sys.argv", ["ocp_ee.py", "prepare-pr"]), \
+                        patch.object(EE.subprocess, "run", side_effect=run), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                        self.assertRaises(SystemExit) as failure:
+                    EE.main()
+                self.assertEqual(failure.exception.code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                message = stderr.getvalue()
+                self.assertIn(f"Base image {operation} failed (exit code {code})", message)
+                self.assertIn("quay.io/s4v0/dcm-base-ee:latest", message)
+                self.assertIn(f"\nPodman: {expected}", message)
+                if diagnostic:
+                    self.assertIn("original stderr redacted", message)
+                self.assertNotIn("\n::warning::", message)
+                self.assertNotIn("private stdout", message)
+                self.assertEqual(len(commands), 1 if operation == "pull" else 2)
+
+    def test_base_diagnostic_classifies_only_fixed_reasons(self):
+        cases = (
+            ("unauthorized: authentication required", "Registry authentication failed"),
+            ("permission denied", "Access denied"),
+            ("manifest unknown", "Image or manifest not found"),
+            ("no such image", "Local image not found"),
+            ("x509: certificate signed by unknown authority", "TLS or certificate failure"),
+            ("lookup quay.io: no such host", "DNS resolution failed"),
+            ("context deadline exceeded", "Operation timed out"),
+            ("connection refused", "Network connection failed"),
+            ("no space left on device", "Storage space exhausted"),
+            ("toomanyrequests", "Registry rate limit reached"),
+            ("opaque diagnostic", "Unrecognized error"),
+        )
+        for diagnostic, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(EE.base_diagnostic(diagnostic), reason + "; original stderr redacted")
+        self.assertEqual(EE.base_diagnostic("  \n"), "No stderr captured")
+
+    def test_cli_redacts_synthetic_credentials_in_pull_and_inspect_failures(self):
+        username = "synthetic-robot-account"
+        password = "synthetic-Pa$$word:/+42"
+        token = "synthetic-opaque-token-0987654321"
+        encoded_auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+        payloads = (
+            f"QUAY_USERNAME={username}\nQUAY_PASSWORD={password}\nGITHUB_TOKEN={token}",
+            f"https://{username}:{password}@registry.invalid/token?access_token={token}",
+            f"Authorization: Basic {encoded_auth}\nAuthorization: Bearer {token}",
+            json.dumps({"auths": {"registry.invalid": {"auth": encoded_auth,
+                        "username": username, "password": password, "identitytoken": token}}}),
+            "https://registry.invalid/?password=synthetic-Pa%24%24word%3A%2F%2B42",
+            f"{username}\n{password}\n{token}\n{encoded_auth}",
+            f"::error::{token}\r\n\x1b[31m{password}\x1b[0m",
+        )
+        for operation in ("pull", "inspect"):
+            for prefix in ("unauthorized: ", "unrecognized failure: "):
+                for payload in payloads:
+                    with self.subTest(operation=operation, known_reason=prefix.startswith("unauthorized"),
+                                      payload_index=payloads.index(payload)):
+                        def run(argv, **kwargs):
+                            if argv[1] == "pull" and operation == "inspect":
+                                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+                            raise subprocess.CalledProcessError(125, argv, output=payload,
+                                                                stderr=prefix + payload)
+
+                        stdout, stderr = io.StringIO(), io.StringIO()
+                        with patch("sys.argv", ["ocp_ee.py", "prepare-pr"]), \
+                                patch.object(EE.subprocess, "run", side_effect=run), \
+                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                                self.assertRaises(SystemExit) as failure:
+                            EE.main()
+                        self.assertEqual(failure.exception.code, 1)
+                        self.assertEqual(stdout.getvalue(), "")
+                        reason = ("Registry authentication failed" if prefix.startswith("unauthorized")
+                                  else "Unrecognized error")
+                        self.assertEqual(stderr.getvalue(),
+                                         f"ERROR: OCP EE prepare-pr failed: Base image {operation} failed "
+                                         "(exit code 125) for quay.io/s4v0/dcm-base-ee:latest\n"
+                                         f"Podman: {reason}; original stderr redacted; preserve build evidence.\n")
+                        for secret in (username, password, token, encoded_auth,
+                                       "synthetic-Pa%24%24word%3A%2F%2B42"):
+                            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+
+    def test_unrelated_command_failures_keep_captured_output_private(self):
+        error = subprocess.CalledProcessError(125, ["podman", "push"],
+                                              output="private stdout", stderr="private stderr")
+        stderr = io.StringIO()
+        with patch("sys.argv", ["ocp_ee.py", "prepare-pr"]), \
+                patch.object(EE, "prepare_pr", side_effect=error), \
+                contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            EE.main()
+        self.assertIn("CalledProcessError", stderr.getvalue())
+        self.assertNotIn("private", stderr.getvalue())
+
     def test_preparation_pins_existing_base_once_without_building(self):
         runner = Runner()
         plan = EE.prepare_pr(runner)
@@ -503,9 +694,16 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(job["environment"], "test")
             checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
             self.assertEqual(checkout["with"]["ref"], "${{ github.event.pull_request.head.sha }}")
-            quay_login = next(step for step in job["steps"] if step.get("with", {}).get("registry") == "quay.io")
-            self.assertEqual(quay_login["with"]["username"], "${{ secrets.QUAY_USERNAME }}")
-            self.assertEqual(quay_login["with"]["password"], "${{ secrets.QUAY_PASSWORD }}")
+        quay_login = next(step for step in prepare["steps"] if step["name"] == "Log in to Quay for the published base")
+        self.assertEqual(quay_login["env"]["REGISTRY_USERNAME"], "${{ secrets.QUAY_USERNAME }}")
+        self.assertEqual(quay_login["env"]["REGISTRY_PASSWORD"], "${{ secrets.QUAY_PASSWORD }}")
+        ghcr_login = next(step for step in prepare["steps"] if step["name"] == "Log in to GHCR for published bases")
+        self.assertEqual(ghcr_login["env"]["REGISTRY_USERNAME"], "${{ github.actor }}")
+        self.assertEqual(ghcr_login["env"]["REGISTRY_PASSWORD"], "${{ secrets.GITHUB_TOKEN }}")
+        for registry, step in (("quay.io", quay_login), ("ghcr.io", ghcr_login)):
+            self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
+        self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login")
+                             for step in prepare["steps"]))
         command = next(step for step in build["steps"] if step["name"] == "Build and verify PR image against the pinned base")
         self.assertEqual(command["env"]["OCP_BASE"], "${{ needs.prepare.outputs.base }}")
         self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.event.pull_request.head.sha }}")
@@ -515,6 +713,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
         validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/workflows/pr-ocp-ee-build.yml", validation["on"]["pull_request"]["paths"])
+
+    def test_preparation_only_mode_gates_build_and_publication(self):
+        workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
+        prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
+        self.assertEqual(build["if"], "${{ false }}")
+        self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
+        self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
+        for step in prepare["steps"]:
+            command = step.get("run", "")
+            self.assertNotIn("ansible-builder", command)
+            self.assertNotRegex(command, r"ocp_ee\.py\s+(?:build|publish)\b")
+            self.assertNotRegex(command, r"podman\s+(?:build|push)\b")
+            if step.get("uses", "").startswith("actions/upload-artifact@"):
+                self.assertEqual(step["with"]["path"], "${{ runner.temp }}/ocp-ee-pr-plan.json")
 
 
 if __name__ == "__main__":
