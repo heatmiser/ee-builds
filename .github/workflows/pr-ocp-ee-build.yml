@@ -69,12 +69,12 @@ jobs:
         with:
           name: ocp-ee-pr-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ocp-ee-pr-plan.json
+          retention-days: 7
           if-no-files-found: ignore
 
   build:
-    # Temporary preparation-only diagnostics. Re-enable only after artifact
-    # publication hardening and explicit review; this also gates GHCR publishing.
-    if: ${{ false }}
+    # Qualify against the published base only after same-repository preparation.
+    if: github.event.pull_request.head.repo.full_name == github.repository && needs.prepare.result == 'success'
     needs: prepare
     runs-on: ubuntu-latest
     environment: test
@@ -101,25 +101,22 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Log in to Quay for the published base
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Log in to Red Hat registry
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_SA_USERNAME }}
-          password: ${{ secrets.REDHAT_SA_PASSWORD }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry registry.redhat.io
 
       - name: Log in to GHCR
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry ghcr.io
 
       - name: Build and verify PR image against the pinned base
         env:
@@ -147,8 +144,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-pr-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json
-            ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/build.log
+          path: ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json
+          retention-days: 7
           if-no-files-found: ignore
 ...

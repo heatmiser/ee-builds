@@ -22,11 +22,16 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / ".github/ocp-ee-streams.json"
 STREAM_PATTERN = r"[1-9][0-9]*\.(?:0|[1-9][0-9]*)"
 ARCHIVES = ("openshift-client-linux.tar.gz", "openshift-install-linux.tar.gz")
+LOGIN_REGISTRIES = ("quay.io", "ghcr.io", "registry.redhat.io")
+
+
+class PublicError(ValueError):
+    """An explicitly safe diagnostic, containing no arbitrary command output."""
 
 
 def require(condition, message):
     if not condition:
-        raise ValueError(message)
+        raise PublicError(message)
 
 
 def configuration():
@@ -174,7 +179,7 @@ def execute(argv, cwd=None):
 
 def registry_login(registry):
     """Authenticate without putting passwords in argv or publishing tool output."""
-    require(registry in ("quay.io", "ghcr.io"), "Unsupported registry login target")
+    require(registry in LOGIN_REGISTRIES, "Unsupported registry login target")
     environment = dict(os.environ)
     username = environment.pop("REGISTRY_USERNAME", "")
     password = environment.pop("REGISTRY_PASSWORD", "")
@@ -185,7 +190,7 @@ def registry_login(registry):
                        timeout=120, env=environment)
     except (OSError, subprocess.SubprocessError, ValueError):
         # Even exception strings may include credentials or captured tool output.
-        raise ValueError(f"Registry login failed for {registry}; command output suppressed") from None
+        raise PublicError(f"Registry login failed for {registry}; command output suppressed") from None
 
 
 def base_diagnostic(stderr):
@@ -226,7 +231,7 @@ def pinned_base(reference, run=execute):
             result = run(argv)
         except subprocess.CalledProcessError as error:
             diagnostic = base_diagnostic(error.stderr)
-            raise ValueError(f"Base image {operation} failed (exit code {error.returncode})"
+            raise PublicError(f"Base image {operation} failed (exit code {error.returncode})"
                              f" for {reference}\nPodman: {diagnostic}") from None
     digests = json.loads(result)
     repository = reference.split("@", 1)[0].split(":", 1)[0]
@@ -264,6 +269,7 @@ def verify_tools(version, installer, client):
 
 
 def write_receipt(path, record):
+    validate_receipt(record)
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
 
@@ -271,6 +277,56 @@ def normalize_image_id(value):
     match = re.fullmatch(r"(?:sha256:)?([a-f0-9]{64})", value) if isinstance(value, str) else None
     require(match is not None, "Invalid local image ID")
     return match[1]
+
+
+def validate_receipt(record):
+    """Accept only bounded provenance fields suitable for a public artifact.
+
+    Never include tool output, arbitrary image labels or unknown JSON fields.
+    Validate before writing and before consuming an on-disk receipt for publish.
+    """
+    fields = {"schema_version", "verified", "selection", "release", "stream", "definition",
+              "mirror_root", "image", "image_id", "tags", "pr", "commit", "run_id",
+              "base_image", "archive_sha256", "release_image", "verified_at"}
+    published = {"published_tags", "published_image"}
+    require(isinstance(record, dict) and (set(record) == fields or set(record) == fields | published),
+            "Receipt contains missing or unsupported fields")
+    require(type(record["schema_version"]) is int and record["schema_version"] == 2
+            and record["verified"] is True, "Require a verified v2 build receipt")
+    require(all(isinstance(record[key], str) for key in fields - {
+        "schema_version", "verified", "tags", "archive_sha256", "image_id"}), "Invalid receipt field type")
+    version = release_version(record["release"])
+    stream = release_stream(version)
+    image = image_name(version)
+    require(record["stream"] == stream, "Receipt stream differs from release")
+    require(record["definition"] == stream_settings(stream)["definition"]
+            and record["mirror_root"] == configuration()["mirror_root"], "Receipt source differs from configuration")
+    tags = image_tags(version, record["selection"], record["commit"], record["run_id"], record["pr"])
+    require(record["tags"] == tags, "Receipt tags differ from build selection")
+    require(record["image"] == f"localhost/{image}:{tags[0]}", "Receipt image differs from release")
+    normalize_image_id(record["image_id"])
+    require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee@sha256:[a-f0-9]{64}",
+                         record["base_image"]), "Invalid receipt base digest")
+    require(re.fullmatch(r"quay\.io/openshift-release-dev/(?:ocp-release|ocp-v4\.0-art-dev)@sha256:[a-f0-9]{64}",
+                         record["release_image"]), "Invalid receipt release payload")
+    hashes = record["archive_sha256"]
+    require(isinstance(hashes, dict) and set(hashes) == set(ARCHIVES)
+            and all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) for value in hashes.values()),
+            "Invalid receipt archive checksums")
+    require(re.fullmatch(r"[0-9]{4}(?:-[0-9]{2}){2}T[0-9]{2}(?::[0-9]{2}){2}(?:\.[0-9]{1,6})?\+00:00",
+                         record["verified_at"]), "Invalid receipt verification timestamp")
+    datetime.fromisoformat(record["verified_at"])
+    if published <= set(record):
+        destination = record["published_image"]
+        require(isinstance(destination, str), "Invalid published image reference")
+        match = re.fullmatch(r"((quay\.io|ghcr\.io)/[a-z0-9_-]+/" + re.escape(image)
+                             + r")@sha256:[a-f0-9]{64}", destination)
+        require(match is not None and bool(record["pr"]) == (match[2] == "ghcr.io"),
+                "Invalid published image reference")
+        completed = record["published_tags"]
+        require(isinstance(completed, list) and 1 <= len(completed) <= len(tags)
+                and completed == [f"{match[1]}:{tag}" for tag in tags[:len(completed)]],
+                "Invalid completed publication tags")
 
 
 def build(selection, base, commit, run_id, output, pr="", run=execute, opener=urllib.request.urlopen):
@@ -315,12 +371,8 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
 def publish(receipt, registry, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+", registry), "Invalid image registry namespace")
     record = json.loads(receipt.read_text())
-    require(record.get("schema_version") == 2 and record.get("verified") is True, "Require a verified v2 build receipt")
+    validate_receipt(record)
     image = image_name(record["release"])
-    require(record["stream"] == release_stream(record["release"]), "Receipt stream differs from release")
-    require(record["tags"] == image_tags(record["release"], record["selection"], record["commit"],
-                                        record["run_id"], record["pr"]), "Receipt tags differ from build selection")
-    require(record["image"] == f"localhost/{image}:{record['tags'][0]}", "Receipt image differs from release")
     require(bool(record["pr"]) == registry.startswith("ghcr.io/"), "PR builds publish only to GHCR; releases only to Quay")
     record["image_id"] = normalize_image_id(record["image_id"])
     # Recheck immutable local content before any tag can reach a registry.
@@ -352,7 +404,7 @@ def main():
     commands.add_parser("automation-matrix")
     commands.add_parser("prepare-pr")
     login = commands.add_parser("registry-login")
-    login.add_argument("--registry", required=True, choices=("quay.io", "ghcr.io"))
+    login.add_argument("--registry", required=True, choices=LOGIN_REGISTRIES)
     base = commands.add_parser("resolve-base")
     base.add_argument("--reference", required=True)
     builder = commands.add_parser("build")
@@ -394,7 +446,7 @@ def main():
                     stream.write(summary)
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         # Do not echo captured command output: inherited build steps may contain credentials.
-        detail = str(error) if isinstance(error, ValueError) else type(error).__name__
+        detail = str(error) if isinstance(error, PublicError) else type(error).__name__
         parser.exit(1, f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n")
 
 

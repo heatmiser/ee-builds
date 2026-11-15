@@ -222,7 +222,7 @@ class RegistryLoginTests(unittest.TestCase):
             json.dumps({"auth": encoded, "identitytoken": password}),
             f"{username}\n{password}\n{encoded}\r\n\x1b[31m{password}\x1b[0m",
         )
-        for registry in ("quay.io", "ghcr.io"):
+        for registry in ("quay.io", "ghcr.io", "registry.redhat.io"):
             for success in (True, False):
                 for index, message in enumerate(messages):
                     with self.subTest(registry=registry, success=success, payload=index):
@@ -291,6 +291,89 @@ class RegistryLoginTests(unittest.TestCase):
             username, password = "user", "password"
             EE.registry_login(f"https://{username}:{password}@unknown.invalid")
         run.assert_not_called()
+
+
+class PublicOutputTests(unittest.TestCase):
+    def test_build_and_publish_failures_suppress_untrusted_exception_text(self):
+        secret = "synthetic-build-publish-secret:/+$"
+        encoded = base64.b64encode(secret.encode()).decode()
+        payloads = (secret, f"Authorization: Bearer {secret}",
+                    json.dumps({"auth": encoded}), f"::error::{secret}\n\x1b[31m{encoded}\x1b[0m")
+        for command in ("build", "publish"):
+            arguments = (["--release", "4.22.22", "--base", BASE, "--commit", COMMIT,
+                          "--run-id", "123-1", "--output", "/unused/build"] if command == "build"
+                         else ["--receipt", "/unused/receipt.json", "--registry", "ghcr.io/heatmiser"])
+            for payload in payloads:
+                errors = (ValueError(payload), OSError(payload), KeyError(payload),
+                          UnicodeDecodeError("utf-8", payload.encode(), 0, 1, payload),
+                          subprocess.CalledProcessError(125, ["podman", payload], output=payload, stderr=payload),
+                          subprocess.TimeoutExpired(["podman", payload], 1, output=payload, stderr=payload))
+                for error in errors:
+                    with self.subTest(command=command, error=type(error).__name__, payload=payloads.index(payload)):
+                        stdout, stderr, summary = io.StringIO(), io.StringIO(), io.StringIO()
+                        with patch("sys.argv", ["ocp_ee.py", command, *arguments]), \
+                                patch.object(EE, command, side_effect=error), \
+                                patch.object(EE.Path, "open", return_value=summary) as opened, \
+                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                                self.assertRaises(SystemExit) as failure:
+                            EE.main()
+                        self.assertEqual(failure.exception.code, 1)
+                        self.assertEqual(stdout.getvalue(), "")
+                        self.assertEqual(stderr.getvalue(), f"ERROR: OCP EE {command} failed: "
+                                         f"{type(error).__name__}; preserve build evidence.\n")
+                        opened.assert_not_called()
+                        self.assertEqual(summary.getvalue(), "")
+                        self.assertNotIn(secret, stderr.getvalue())
+                        self.assertNotIn(encoded, stderr.getvalue())
+
+    def test_raw_builder_output_stays_local_on_success_failure_and_timeout(self):
+        secret = "synthetic-builder-output-secret"
+        for outcome in ("success", "failure", "timeout"):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "source"
+                source.mkdir()
+                stdout, stderr = io.StringIO(), io.StringIO()
+
+                def run(argv, **kwargs):
+                    self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+                    self.assertTrue(kwargs["check"])
+                    self.assertEqual(kwargs["timeout"], 3600)
+                    kwargs["stdout"].write(f"stdout={secret}\nstderr={secret}\n")
+                    if outcome == "failure":
+                        raise subprocess.CalledProcessError(1, argv, output=secret, stderr=secret)
+                    if outcome == "timeout":
+                        raise subprocess.TimeoutExpired(argv, 3600, output=secret, stderr=secret)
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with patch.object(EE.subprocess, "run", side_effect=run), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    if outcome == "success":
+                        self.assertEqual(EE.execute(["ansible-builder", "build"], cwd=source), "")
+                    else:
+                        with self.assertRaises(subprocess.SubprocessError):
+                            EE.execute(["ansible-builder", "build"], cwd=source)
+                self.assertIn(secret, (Path(directory) / "build.log").read_text())
+                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_raw_podman_output_is_captured_on_success_and_failure(self):
+        secret = "synthetic-push-output-secret"
+        for success in (True, False):
+            def run(argv, **kwargs):
+                self.assertTrue(kwargs["capture_output"])
+                self.assertTrue(kwargs["check"])
+                if not success:
+                    raise subprocess.CalledProcessError(125, argv, output=secret, stderr=secret)
+                return subprocess.CompletedProcess(argv, 0, stdout=secret, stderr=secret)
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(success=success), patch.object(EE.subprocess, "run", side_effect=run), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                if success:
+                    self.assertEqual(EE.execute(["podman", "push"]), secret)
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        EE.execute(["podman", "push"])
+            self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
 
 class PRPreparationTests(unittest.TestCase):
@@ -472,6 +555,43 @@ class BuildAndPublishTests(unittest.TestCase):
                 EE.build("4.22.22", BASE, COMMIT, "123-1", output, run=runner, opener=Mirror())
             self.assertFalse((output / "receipt.json").exists())
 
+    def test_receipt_writer_rejects_secret_bearing_or_unknown_fields(self):
+        receipt, _ = self.build()
+        original = json.loads(receipt.read_text())
+        secret = "synthetic-receipt-secret"
+        mutations = [(key, secret) for key in original]
+        mutations += [("unexpected_stdout", secret), ("published_image", secret),
+                      ("archive_sha256", {**original["archive_sha256"], "auth": secret}),
+                      ("archive_sha256", {name: secret for name in EE.ARCHIVES}),
+                      ("tags", original["tags"] + [secret]), ("schema_version", True)]
+        for index, (key, value) in enumerate(mutations):
+            with self.subTest(field=key, case=index):
+                record = {**original, key: value}
+                target = self.output / f"rejected-{index}.json"
+                with self.assertRaises(ValueError):
+                    EE.write_receipt(target, record)
+                self.assertFalse(target.exists())
+
+    def test_altered_receipt_metadata_is_rejected_before_publication(self):
+        receipt, _ = self.build()
+        original = json.loads(receipt.read_text())
+        for key in ("archive_sha256", "release_image", "base_image", "verified_at", "extra_output"):
+            with self.subTest(field=key):
+                receipt.write_text(json.dumps({**original, key: "synthetic-untrusted-secret"}))
+                runner = Runner()
+                with self.assertRaises(ValueError):
+                    EE.publish(receipt, "quay.io/s4v0", runner)
+                self.assertEqual(runner.commands, [])
+
+    def test_published_receipt_cannot_carry_extra_tags_or_text(self):
+        receipt, runner = self.build()
+        original = EE.publish(receipt, "quay.io/s4v0", runner)
+        for key, value in (("published_image", "synthetic-published-secret"),
+                           ("published_tags", original["published_tags"] + ["synthetic-tag-secret"]),
+                           ("published_tags", [])):
+            with self.subTest(field=key, value_type=type(value).__name__), self.assertRaises(ValueError):
+                EE.write_receipt(self.output / "rejected-publication.json", {**original, key: value})
+
     def test_publication_pushes_unique_tag_then_patch_without_latest(self):
         receipt, runner = self.build()
         result = EE.publish(receipt, "quay.io/s4v0", runner)
@@ -520,7 +640,7 @@ class BuildAndPublishTests(unittest.TestCase):
         for key, value in (("stream", "5.0"), ("image", "localhost/dcm-ocp-ee-5.0:0")):
             record = dict(original)
             record[key] = value
-            EE.write_receipt(receipt, record)
+            receipt.write_text(json.dumps(record))
             runner = Runner()
             with self.assertRaises(ValueError):
                 EE.publish(receipt, "quay.io/s4v0", runner)
@@ -562,7 +682,7 @@ class BuildAndPublishTests(unittest.TestCase):
         for image_id in (None, 123, "c" * 12, "sha256:" + "g" * 64, IMAGE_ID + " extra"):
             with self.subTest(image_id=image_id):
                 record["image_id"] = image_id
-                EE.write_receipt(receipt, record)
+                receipt.write_text(json.dumps(record))
                 runner = Runner()
                 with self.assertRaisesRegex(ValueError, "Invalid local image ID"):
                     EE.publish(receipt, "quay.io/s4v0", runner)
@@ -616,7 +736,7 @@ class BuildAndPublishTests(unittest.TestCase):
         receipt, runner = self.build()
         record = json.loads(receipt.read_text())
         record["tags"].append("latest")
-        EE.write_receipt(receipt, record)
+        receipt.write_text(json.dumps(record))
         with self.assertRaises(ValueError):
             EE.publish(receipt, "quay.io/s4v0", runner)
 
@@ -647,6 +767,52 @@ class BuildAndPublishTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_openshift_artifacts_allow_only_receipts_and_plan_with_bounded_retention(self):
+        expected = {
+            "pr-ocp-ee-build.yml": ("7", {
+                "${{ runner.temp }}/ocp-ee-pr-plan.json",
+                "${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json",
+            }),
+            "pr-ee-build.yml": ("7", {
+                "${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json",
+            }),
+            "push-ee-build.yml": ("30", {
+                "${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json",
+            }),
+            "build-versioned-ocp-ee.yml": ("30", {
+                "${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json",
+            }),
+        }
+        for filename, (retention, paths) in expected.items():
+            with self.subTest(workflow=filename):
+                workflow = yaml.load((ROOT / ".github/workflows" / filename).read_text(), Loader=yaml.BaseLoader)
+                uploads = [step["with"] for job in workflow["jobs"].values() for step in job.get("steps", [])
+                           if step.get("uses", "").startswith("actions/upload-artifact@")
+                           and step["with"]["name"].startswith("ocp-ee-")]
+                self.assertEqual(len(uploads), len(paths))
+                self.assertEqual({upload["path"] for upload in uploads}, paths)
+                for upload in uploads:
+                    self.assertEqual(upload["retention-days"], retention)
+                    self.assertNotIn("include-hidden-files", upload)
+
+    def test_qualification_build_uses_captured_logins_for_all_three_registries(self):
+        workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
+        steps = workflow["jobs"]["build"]["steps"]
+        logins = [step for step in steps if "registry-login" in step.get("run", "")]
+        self.assertEqual(len(logins), 3)
+        expected = {
+            "quay.io": ("${{ secrets.QUAY_USERNAME }}", "${{ secrets.QUAY_PASSWORD }}"),
+            "ghcr.io": ("${{ github.actor }}", "${{ secrets.GITHUB_TOKEN }}"),
+            "registry.redhat.io": ("${{ secrets.REDHAT_SA_USERNAME }}", "${{ secrets.REDHAT_SA_PASSWORD }}"),
+        }
+        for step in logins:
+            registry = step["run"].rsplit(" ", 1)[1]
+            self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
+            self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+            self.assertNotIn("uses", step)
+        self.assertEqual({step["run"].rsplit(" ", 1)[1] for step in logins}, set(expected))
+        self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
+
     def test_manual_workflow_uses_shared_digest_and_safe_input_binding(self):
         path = ROOT / ".github/workflows/build-versioned-ocp-ee.yml"
         workflow = yaml.safe_load(path.read_text())
@@ -714,10 +880,15 @@ class WorkflowTests(unittest.TestCase):
         validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/workflows/pr-ocp-ee-build.yml", validation["on"]["pull_request"]["paths"])
 
-    def test_preparation_only_mode_gates_build_and_publication(self):
+    def test_qualification_requires_successful_same_repo_preparation(self):
         workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
         prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
-        self.assertEqual(build["if"], "${{ false }}")
+        self.assertEqual(build["if"], "github.event.pull_request.head.repo.full_name == github.repository "
+                         "&& needs.prepare.result == 'success'")
+        self.assertEqual(build["needs"], "prepare")
+        self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
+        images = yaml.load((ROOT / ".github/workflows/pr-image-build.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(images["jobs"]["build-image"]["if"], "${{ false }}")
         self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
         self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
         for step in prepare["steps"]:

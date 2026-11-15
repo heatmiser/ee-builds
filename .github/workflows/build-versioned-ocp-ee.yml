@@ -109,8 +109,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json
-            ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/build.log
+          path: ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json
+          retention-days: 30
           if-no-files-found: ignore
 ...

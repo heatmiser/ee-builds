@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - ".github/scripts/ocp_ee.py"
+      - ".github/scripts/ci_report.py"
       - ".github/ocp-ee-streams.json"
       - ".github/workflows/build-versioned-ocp-ee.yml"
       - ".github/workflows/pr-ocp-ee-build.yml"
@@ -12,8 +13,11 @@ on:
       - ".github/workflows/generate_image_matrix.py"
       - ".github/workflows/pr-ee-build.yml"
       - ".github/workflows/push-ee-build.yml"
+      - ".github/workflows/pr-image-build.yml"
+      - ".github/workflows/push-image-build.yml"
       - "dcm-ocp-ee-4.22/**"
       - "tests/test_ocp_ee.py"
+      - "tests/test_ci_report.py"
       - "tests/test_generate_image_matrix.py"
       - "requirements.txt"
   workflow_dispatch:
