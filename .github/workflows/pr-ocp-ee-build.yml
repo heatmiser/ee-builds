@@ -29,7 +29,7 @@ jobs:
       packages: read
     outputs:
       matrix: ${{ steps.prepare.outputs.matrix }}
-      base: ${{ steps.prepare.outputs.base }}
+      plan_artifact: ${{ steps.prepare.outputs.plan_artifact }}
     steps:
       - name: Check out PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -60,7 +60,8 @@ jobs:
           plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "ocp-ee-pr-plan.json").read_text())
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("matrix=" + json.dumps(plan["matrix"]) + "\n")
-              output.write("base=" + plan["base"] + "\n")
+              output.write("plan_artifact=ocp-ee-pr-plan-" + os.environ["GITHUB_RUN_ID"]
+                           + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "\n")
           PY
 
       - name: Preserve qualification plan
@@ -92,6 +93,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
+      - name: Download prepared qualification plan
+        uses: actions/download-artifact@v4
+        with:
+          # Reuse preparation's name when only failed build jobs are rerun.
+          name: ${{ needs.prepare.outputs.plan_artifact }}
+          path: ${{ runner.temp }}/ocp-ee-plan
+
       - name: Install pinned Ansible Builder
         run: pip install -r requirements.txt
 
@@ -121,11 +129,31 @@ jobs:
       - name: Build and verify PR image against the pinned base
         env:
           OCP_RELEASE: ${{ matrix.release }}
-          OCP_BASE: ${{ needs.prepare.outputs.base }}
+          OCP_PLAN: ${{ runner.temp }}/ocp-ee-plan/ocp-ee-pr-plan.json
           SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
           BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          # Read the public reference locally: masked namespaces can suppress job outputs.
+          OCP_BASE=$(python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          try:
+              plan = json.loads(Path(os.environ["OCP_PLAN"]).read_text())
+              base = plan["base"]
+              release = os.environ["OCP_RELEASE"]
+              expected = {"release": release, "stream": release.rsplit(".", 1)[0]}
+              if (not isinstance(base, str)
+                      or not re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee@sha256:[a-f0-9]{64}", base)
+                      or expected not in plan["matrix"]["include"]):
+                  raise ValueError
+          except (ValueError, KeyError, TypeError, OSError):
+              raise SystemExit("Invalid qualification plan; original content suppressed.") from None
+          print(base)
+          PY
+          )
           python3 .github/scripts/ocp_ee.py build \
             --release "$OCP_RELEASE" --base "$OCP_BASE" \
             --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" --pr "$PR_NUMBER" \

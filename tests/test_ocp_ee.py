@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -871,7 +872,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login")
                              for step in prepare["steps"]))
         command = next(step for step in build["steps"] if step["name"] == "Build and verify PR image against the pinned base")
-        self.assertEqual(command["env"]["OCP_BASE"], "${{ needs.prepare.outputs.base }}")
+        self.assertNotIn("OCP_BASE", command["env"])
+        self.assertEqual(command["env"]["OCP_PLAN"], "${{ runner.temp }}/ocp-ee-plan/ocp-ee-pr-plan.json")
         self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.event.pull_request.head.sha }}")
         self.assertIn('--pr "$PR_NUMBER"', command["run"])
         publish = next(step for step in build["steps"] if step["name"] == "Publish verified PR image to GHCR")
@@ -879,6 +881,67 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
         validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/workflows/pr-ocp-ee-build.yml", validation["on"]["pull_request"]["paths"])
+
+    def test_plan_handoff_uses_preparation_artifact_name_without_exporting_base(self):
+        workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
+        prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
+        self.assertEqual(prepare["outputs"], {"matrix": "${{ steps.prepare.outputs.matrix }}",
+                                              "plan_artifact": "${{ steps.prepare.outputs.plan_artifact }}"})
+        upload = next(s for s in prepare["steps"] if s["name"] == "Preserve qualification plan")
+        download = next(s for s in build["steps"] if s["name"] == "Download prepared qualification plan")
+        self.assertEqual(upload["with"]["name"], "ocp-ee-pr-plan-${{ github.run_id }}-${{ github.run_attempt }}")
+        self.assertEqual(download["uses"], "actions/download-artifact@v4")
+        self.assertEqual(download["with"], {"name": "${{ needs.prepare.outputs.plan_artifact }}",
+                                            "path": "${{ runner.temp }}/ocp-ee-plan"})
+        command = next(s for s in prepare["steps"] if s.get("id") == "prepare")["run"]
+        script = command.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            plan = {"base": BASE, "matrix": {"include": [{"release": "4.22.22", "stream": "4.22"}]}}
+            (parent / "ocp-ee-pr-plan.json").write_text(json.dumps(plan))
+            target = parent / "github-output"
+            environment = dict(os.environ, RUNNER_TEMP=directory, GITHUB_OUTPUT=str(target),
+                               GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="1")
+            result = subprocess.run([sys.executable, "-"], input=script, text=True,
+                                    capture_output=True, env=environment, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+            output = dict(line.split("=", 1) for line in target.read_text().splitlines())
+            self.assertEqual(json.loads(output["matrix"]), plan["matrix"])
+            self.assertEqual(output["plan_artifact"], "ocp-ee-pr-plan-12345-1")
+            self.assertNotIn(BASE, target.read_text())
+            self.assertNotIn("base", output)
+        names = [s["name"] for s in build["steps"]]
+        self.assertLess(names.index("Download prepared qualification plan"),
+                        names.index("Build and verify PR image against the pinned base"))
+
+    def test_build_reads_and_validates_file_plan_with_base_job_output_absent(self):
+        workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
+        command = next(s for s in workflow["jobs"]["build"]["steps"]
+                       if s["name"] == "Build and verify PR image against the pinned base")["run"]
+        script = command.split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0]
+        self.assertIn('--base "$OCP_BASE"', command)
+        self.assertNotIn("needs.prepare.outputs.base", command)
+        plan = {"base": BASE, "matrix": {"include": [{"release": "4.22.22", "stream": "4.22"}]}}
+        secret = "synthetic-plan-secret:/+$"
+        cases = ((plan, True), ({**plan, "base": ""}, False), ({**plan, "base": "quay.io/s4v0/dcm-base-ee:latest"}, False),
+                 ({**plan, "base": secret}, False), ({**plan, "matrix": {"include": []}}, False),
+                 ({**plan, "matrix": {"include": [{"release": "4.22.14", "stream": "4.22"}]}}, False),
+                 ({}, False), ([], False), (secret, False))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ocp-ee-pr-plan.json"
+            environment = dict(os.environ, OCP_PLAN=str(path), OCP_RELEASE="4.22.22", GITHUB_RUN_ATTEMPT="2")
+            environment.pop("OCP_BASE", None)
+            for index, (value, valid) in enumerate(cases):
+                with self.subTest(case=index):
+                    path.write_text(json.dumps(value) if not isinstance(value, str) else value)
+                    result = subprocess.run([sys.executable, "-"], input=script, text=True,
+                                            capture_output=True, env=environment, timeout=10)
+                    self.assertEqual(result.returncode, 0 if valid else 1)
+                    self.assertEqual(result.stdout, BASE + "\n" if valid else "")
+                    self.assertEqual(result.stderr, "" if valid else
+                                     "Invalid qualification plan; original content suppressed.\n")
+                    self.assertNotIn(secret, result.stdout + result.stderr)
 
     def test_qualification_requires_successful_same_repo_preparation(self):
         workflow = yaml.load((ROOT / ".github/workflows/pr-ocp-ee-build.yml").read_text(), Loader=yaml.BaseLoader)
