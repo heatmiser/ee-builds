@@ -210,6 +210,44 @@ class VersionSelectionTests(unittest.TestCase):
                 EE.verify_tools("4.22.22", tool, client)
 
 
+class PRPreparationTests(unittest.TestCase):
+    def test_preparation_pins_existing_base_once_without_building(self):
+        runner = Runner()
+        plan = EE.prepare_pr(runner)
+        self.assertEqual(plan, {"base": BASE, "matrix": {"include": [
+            {"release": "4.22.22", "stream": "4.22"}]}})
+        self.assertEqual([argv for argv in runner.commands if argv[:2] == ["podman", "pull"]],
+                         [["podman", "pull", "--quiet", "quay.io/s4v0/dcm-base-ee:latest"]])
+        self.assertFalse(any(argv[0] == "ansible-builder" or argv[:2] == ["podman", "push"]
+                             for argv in runner.commands))
+
+    def test_explicit_digest_and_multiple_releases_share_one_base(self):
+        config = EE.configuration()
+        config["pr_qualification"] = {"base_image": BASE, "versions": ["4.22.22", "5.0.0"]}
+        runner = Runner()
+        with patch.object(EE, "configuration", return_value=config):
+            plan = EE.prepare_pr(runner)
+        self.assertEqual(plan["base"], BASE)
+        self.assertEqual([entry["release"] for entry in plan["matrix"]["include"]], ["4.22.22", "5.0.0"])
+        self.assertEqual(sum(argv[:2] == ["podman", "pull"] for argv in runner.commands), 1)
+
+    def test_invalid_qualification_settings_fail_before_pulling(self):
+        settings = EE.configuration()["pr_qualification"]
+        invalid = [None, {}, {**settings, "base_image": None},
+                   {**settings, "base_image": "docker.io/unknown/base:latest"}]
+        invalid += [{**settings, "versions": versions} for versions in (
+            [], "4.22.22", [None], ["stable-4.22"], ["4.23.1"],
+            ["4.22.22", "4.22.22"], ["4.22.22,5.0.0"]) ]
+        for value in invalid:
+            with self.subTest(settings=value):
+                config = EE.configuration()
+                config["pr_qualification"] = value
+                runner = Runner()
+                with patch.object(EE, "configuration", return_value=config), self.assertRaises(ValueError):
+                    EE.prepare_pr(runner)
+                self.assertEqual(runner.commands, [])
+
+
 class BuildAndPublishTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -347,6 +385,25 @@ class BuildAndPublishTests(unittest.TestCase):
         self.assertEqual(len(result["published_tags"]), 1)
         self.assertTrue(result["published_tags"][0].endswith(":22-pr-65-aaaaaaaaaaaa-123-1"))
 
+    def test_independent_pr_build_uses_prepared_digest_and_only_a_ghcr_pr_tag(self):
+        runner = Runner()
+        plan = EE.prepare_pr(runner)
+        release = plan["matrix"]["include"][0]["release"]
+        receipt = EE.build(release, plan["base"], COMMIT, "123-1", self.output,
+                           pr="64", run=runner, opener=Mirror())
+        build = next(argv for argv in runner.commands if argv[0] == "ansible-builder")
+        self.assertIn("EE_BASE_IMAGE=" + BASE, build)
+        pulls = [argv[-1] for argv in runner.commands if argv[:2] == ["podman", "pull"]]
+        self.assertEqual(pulls, ["quay.io/s4v0/dcm-base-ee:latest", BASE])
+        record = json.loads(receipt.read_text())
+        self.assertEqual(record["base_image"], plan["base"])
+        with self.assertRaises(ValueError):
+            EE.publish(receipt, "quay.io/s4v0", runner)
+        result = EE.publish(receipt, "ghcr.io/heatmiser", runner)
+        self.assertEqual(result["published_tags"], [
+            "ghcr.io/heatmiser/dcm-ocp-ee-4.22:22-pr-64-aaaaaaaaaaaa-123-1"])
+        self.assertEqual(sum(argv[0] == "ansible-builder" for argv in runner.commands), 1)
+
     def test_wrong_version_at_publication_cannot_push(self):
         receipt, _ = self.build()
         runner = Runner(version="4.22.14")
@@ -430,6 +487,34 @@ class WorkflowTests(unittest.TestCase):
     def test_stream_configuration_changes_trigger_validation(self):
         workflow = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
+
+    def test_pr_qualification_is_independent_and_publishes_only_to_ghcr(self):
+        path = ROOT / ".github/workflows/pr-ocp-ee-build.yml"
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
+        prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
+        self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
+        self.assertNotIn("needs", prepare)
+        self.assertEqual(build["needs"], "prepare")
+        self.assertEqual(build["permissions"]["packages"], "write")
+        self.assertEqual(build["strategy"]["matrix"], "${{ fromJson(needs.prepare.outputs.matrix) }}")
+        self.assertTrue(any("prepare-pr" in step.get("run", "") for step in prepare["steps"]))
+        for job in (prepare, build):
+            self.assertEqual(job["environment"], "test")
+            checkout = next(step for step in job["steps"] if step.get("uses", "").startswith("actions/checkout@"))
+            self.assertEqual(checkout["with"]["ref"], "${{ github.event.pull_request.head.sha }}")
+            quay_login = next(step for step in job["steps"] if step.get("with", {}).get("registry") == "quay.io")
+            self.assertEqual(quay_login["with"]["username"], "${{ secrets.QUAY_USERNAME }}")
+            self.assertEqual(quay_login["with"]["password"], "${{ secrets.QUAY_PASSWORD }}")
+        command = next(step for step in build["steps"] if step["name"] == "Build and verify PR image against the pinned base")
+        self.assertEqual(command["env"]["OCP_BASE"], "${{ needs.prepare.outputs.base }}")
+        self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.event.pull_request.head.sha }}")
+        self.assertIn('--pr "$PR_NUMBER"', command["run"])
+        publish = next(step for step in build["steps"] if step["name"] == "Publish verified PR image to GHCR")
+        self.assertEqual(publish["env"]["OCP_REGISTRY"], "ghcr.io/${{ github.repository_owner }}")
+        self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
+        validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertIn(".github/workflows/pr-ocp-ee-build.yml", validation["on"]["pull_request"]["paths"])
 
 
 if __name__ == "__main__":

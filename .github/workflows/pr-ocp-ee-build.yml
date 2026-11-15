@@ -1,0 +1,153 @@
+---
+name: PR OpenShift EE Qualification
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+    paths:
+      - ".github/scripts/ocp_ee.py"
+      - ".github/ocp-ee-streams.json"
+      - ".github/workflows/pr-ocp-ee-build.yml"
+      - "dcm-ocp-ee-*/**"
+      - "requirements.txt"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocp-ee-qualification-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      base: ${{ steps.prepare.outputs.base }}
+    steps:
+      - name: Check out PR source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Log in to Quay for the published base
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Log in to GHCR for published bases
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve published base once and select exact releases
+        id: prepare
+        run: |
+          python3 .github/scripts/ocp_ee.py prepare-pr > "$RUNNER_TEMP/ocp-ee-pr-plan.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "ocp-ee-pr-plan.json").read_text())
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps(plan["matrix"]) + "\n")
+              output.write("base=" + plan["base"] + "\n")
+          PY
+
+      - name: Preserve qualification plan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocp-ee-pr-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ocp-ee-pr-plan.json
+          if-no-files-found: ignore
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: test
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out PR source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Install pinned Ansible Builder
+        run: pip install -r requirements.txt
+
+      - name: Run offline checks before building
+        env:
+          REQUIRE_BUILDER: "1"
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Log in to Quay for the published base
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_PASSWORD }}
+
+      - name: Log in to Red Hat registry
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: registry.redhat.io
+          username: ${{ secrets.REDHAT_SA_USERNAME }}
+          password: ${{ secrets.REDHAT_SA_PASSWORD }}
+
+      - name: Log in to GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and verify PR image against the pinned base
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+          OCP_BASE: ${{ needs.prepare.outputs.base }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .github/scripts/ocp_ee.py build \
+            --release "$OCP_RELEASE" --base "$OCP_BASE" \
+            --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" --pr "$PR_NUMBER" \
+            --output "$RUNNER_TEMP/ocp-ee-pr-$OCP_RELEASE"
+
+      - name: Publish verified PR image to GHCR
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+          OCP_REGISTRY: ghcr.io/${{ github.repository_owner }}
+        run: |
+          python3 .github/scripts/ocp_ee.py publish \
+            --receipt "$RUNNER_TEMP/ocp-ee-pr-$OCP_RELEASE/receipt.json" --registry "$OCP_REGISTRY"
+
+      - name: Preserve PR qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocp-ee-pr-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json
+            ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/build.log
+          if-no-files-found: ignore
+...

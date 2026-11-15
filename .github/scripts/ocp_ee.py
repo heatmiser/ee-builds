@@ -186,6 +186,20 @@ def pinned_base(reference, run=execute):
     return candidates[0]
 
 
+def prepare_pr(run=execute):
+    settings = configuration().get("pr_qualification")
+    require(isinstance(settings, dict), "Require PR qualification settings")
+    versions = settings.get("versions")
+    require(isinstance(versions, list) and 1 <= len(versions) <= 16,
+            "Require 1-16 exact PR qualification releases")
+    for version in versions:
+        release_version(version)
+    matrix = release_matrix(",".join(versions))
+    base = settings.get("base_image")
+    require(isinstance(base, str), "Require a published PR base image reference")
+    return {"matrix": matrix, "base": pinned_base(base, run)}
+
+
 def verify_tools(version, installer, client):
     require(re.search(r"(?m)^openshift-install " + re.escape(version) + r"$", installer),
             "Final installer version differs from requested release")
@@ -284,6 +298,7 @@ def main():
     matrix = commands.add_parser("matrix")
     matrix.add_argument("--versions", required=True)
     commands.add_parser("automation-matrix")
+    commands.add_parser("prepare-pr")
     base = commands.add_parser("resolve-base")
     base.add_argument("--reference", required=True)
     builder = commands.add_parser("build")
@@ -300,6 +315,8 @@ def main():
             print(json.dumps(release_matrix(args.versions)))
         elif args.command == "automation-matrix":
             print(json.dumps(automation_matrix()))
+        elif args.command == "prepare-pr":
+            print(json.dumps(prepare_pr()))
         elif args.command == "resolve-base":
             print(pinned_base(args.reference))
         elif args.command == "build":

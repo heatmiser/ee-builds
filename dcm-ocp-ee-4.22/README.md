@@ -62,6 +62,36 @@ base/client/installer combination before enabling automatic builds. A single
 manual matrix shares one base digest; use separate dispatches when streams need
 different bases. The inherited dcm-base-ee architecture remains amd64.
 
+## Independent PR qualification
+
+**PR OpenShift EE Qualification** runs for same-repository PRs changing the helper,
+stream configuration, qualification workflow, or OpenShift definition files. It
+does not depend on `build-ee` and does not rebuild `dcm-base-ee`. The existing
+base-rebuild PR workflow remains available for changes to that base.
+
+`pr_qualification` in `.github/ocp-ee-streams.json` selects exact releases and the
+published base reference. Its initial target is 4.22.22, using
+`quay.io/s4v0/dcm-base-ee:latest`. The prepare job pulls that existing image and
+resolves the tag to one repository digest. Every qualification matrix entry then
+builds against that digest, even if the base's tag changes during the run. The
+configuration also accepts an already pinned base reference. Adding a 5.0 release
+to this PR matrix is a separate reviewed configuration choice.
+
+Both preparation and build jobs use GitHub's `test` environment. Its
+`QUAY_USERNAME` and `QUAY_PASSWORD` provide pull access to the existing Quay base;
+pull-only robot credentials are sufficient. The build job uses the existing
+`REDHAT_SA_USERNAME` and `REDHAT_SA_PASSWORD` for registry.redhat.io, and the GitHub
+token with `packages: write` for GHCR publication.
+
+After offline checks, the build job verifies the final tool versions, release
+payload and labels, then publishes only the unique PR tag to
+`ghcr.io/<owner>/dcm-ocp-ee-<stream>:<patch>-pr-<pr>-<commit12>-<run-id>-<attempt>`.
+It does not publish Quay images, patch aliases, or `latest`. The workflow preserves
+the resolved plan, build log and receipt; the receipt and Actions summary contain
+the base digest and the published image digest. Green offline checks and rendered
+Containerfiles alone do not establish that this qualification build succeeded;
+review its actual build and publication jobs.
+
 ## Local preparation and build
 
 From the repository root, with CI-pinned Ansible Builder installed, Podman
@@ -104,6 +134,7 @@ and runtime qualification remain required before accepting the release image.
 
 The existing general matrix excludes OCP-dependent directories. Consequently,
 changing only this definition does not automatically publish a new image. Use the
-dedicated versioned workflow for explicit releases; the existing base-dependent
-workflow continues to drive stable builds. Do not dispatch this image through the
+dedicated versioned workflow for explicit production releases; independent PR
+qualification builds the configured exact PR targets, and the existing
+base-dependent workflow continues to drive stable builds. Do not dispatch this image through the
 generic EE build job, which does not stage release inputs.

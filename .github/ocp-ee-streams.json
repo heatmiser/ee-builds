@@ -1,5 +1,9 @@
 {
   "mirror_root": "https://mirror.openshift.com/pub/openshift-v4/clients/ocp",
+  "pr_qualification": {
+    "base_image": "quay.io/s4v0/dcm-base-ee:latest",
+    "versions": ["4.22.22"]
+  },
   "legacy_streams": ["4.16", "4.17", "4.18", "4.19", "4.20", "4.21"],
   "streams": {
     "4.22": {"definition": "dcm-ocp-ee-4.22", "automatic": true},
