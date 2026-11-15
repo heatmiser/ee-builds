@@ -1,0 +1,8 @@
+{
+  "mirror_root": "https://mirror.openshift.com/pub/openshift-v4/clients/ocp",
+  "legacy_streams": ["4.16", "4.17", "4.18", "4.19", "4.20", "4.21"],
+  "streams": {
+    "4.22": {"definition": "dcm-ocp-ee-4.22", "automatic": true},
+    "5.0": {"definition": "dcm-ocp-ee-4.22", "automatic": false}
+  }
+}

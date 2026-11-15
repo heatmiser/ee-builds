@@ -1,6 +1,6 @@
-# OpenShift 4.22 execution environment builds
+# Versioned OpenShift execution environment builds
 
-One definition builds exact OpenShift 4.22 patch releases. Client and installer
+One parameterized definition builds exact releases from configured streams. Client and installer
 archives come from the same version-specific OpenShift mirror directory. The
 shared helper verifies both SHA256 checksums before staging them, and the image
 checks them again before extraction. The checksum manifest is fetched over HTTPS
@@ -8,31 +8,59 @@ from the same mirror; it is not an independent signature verification.
 
 ## Build selected patches
 
-Run **Versioned OpenShift 4.22 EE Build** in GitHub Actions, selecting the reviewed
+Run **Versioned OpenShift EE Build** in GitHub Actions, selecting the reviewed
 source ref. Set `versions` to a comma-separated list such as `4.22.14,4.22.22`.
+The list may span configured streams; each requested exact release must exist on
+the configured mirror and must pass the final tool checks.
 Supply a published `dcm-base-ee` reference. Preparation resolves that base once;
 every matrix entry uses the same immutable digest. No base rebuild is required.
 
-| Selection | Release alias | Unique build tag | Changes latest |
+| Selection | Repository | Release alias | Changes latest |
 |---|---|---|---|
-| `4.22.14` | `:14` | `:14-<commit12>-<run-id>-<attempt>` | No |
-| `4.22.22` | `:22` | `:22-<commit12>-<run-id>-<attempt>` | No |
-| Existing stable production build | Resolved patch, e.g. `:22` | Same patch-prefixed format | Yes |
-| Existing stable PR build | None | `:22-pr-<pr>-<commit12>-<run-id>-<attempt>` | No |
+| `4.22.14` | `dcm-ocp-ee-4.22` | `:14` | No |
+| `4.22.22` | `dcm-ocp-ee-4.22` | `:22` | No |
+| `5.0.0` (naming example) | `dcm-ocp-ee-5.0` | `:0` | No |
+| Stable production build | Matching stream | Resolved patch | Yes |
+| Stable PR build | Matching stream, GHCR | None | No |
 
-All tags are in `quay.io/<namespace>/dcm-ocp-ee-4.22`, except PR tags, which go
-to GHCR. The patch alias can move when the same patch is rebuilt with an updated
+Unique build tags use `:<patch>-<commit12>-<run-id>-<attempt>`; PR tags use
+`:<patch>-pr-<pr>-<commit12>-<run-id>-<attempt>`.
+Production tags are in `quay.io/<namespace>/dcm-ocp-ee-<major>.<minor>`;
+PR tags go to GHCR. The patch alias can move when the same patch is rebuilt with an updated
 base. Unique build tags distinguish those builds, but registry tags themselves
 are not immutable. Deployments should use the published `@sha256:...` reference.
 The helper removes the inherited `quay.expires-after` label and verifies its
 absence. Registry administrators' other retention/deletion policies still apply.
 
 Explicit version builds never promote `latest`. Existing dependent production
-builds resolve `stable-4.22/release.txt` once, then fetch both archives and checksums
+builds resolve `stable-<major>.<minor>/release.txt` once, reject metadata from a
+different stream, then fetch both archives and checksums
 from the resulting exact release directory. Only that stable production path
-updates `latest`. Other minor-version definitions retain their existing behavior.
-Production 4.22 jobs share a concurrency group; submit one manual release batch at
+updates `latest`. Legacy minor-version definitions retain their existing behavior.
+Production jobs share a concurrency group per stream; submit one manual release batch at
 a time because GitHub concurrency permits only one pending job per group.
+
+## Stream configuration and qualification
+
+`.github/ocp-ee-streams.json` declares the mirror root, versioned stream mappings,
+automatic stable-build flags, and the legacy streams that retain the older build
+path. Output repository names are derived from the release, independently of the
+definition directory. The historical `dcm-ocp-ee-4.22` directory currently supplies
+the shared definition for 4.22 and 5.0. There is no Python image-name pin.
+
+The mirror root remains `https://mirror.openshift.com/pub/openshift-v4/clients/ocp`
+for these configured streams, including 5.0. Product major version does not select
+the mirror directory prefix. Change the configured HTTPS root only when the
+upstream layout requires it.
+
+Only 4.22 has automatic stable builds enabled. 5.0 is an explicit build
+target for qualification, not a qualified release image. Adding another stream
+requires a reviewed configuration entry selecting an existing EE definition;
+no helper edit is needed. If that stream needs different OS dependencies, add a
+compatible definition and select it in the configuration. Verify the actual
+base/client/installer combination before enabling automatic builds. A single
+manual matrix shares one base digest; use separate dispatches when streams need
+different bases. The inherited dcm-base-ee architecture remains amd64.
 
 ## Local preparation and build
 
@@ -44,6 +72,8 @@ python3 .github/scripts/ocp_ee.py build --release 4.22.22 --base quay.io/s4v0/dc
 Use a fresh output directory and a distinct numeric run/attempt identity for each
 build. The helper stages a private copy of the definition; source files are not
 edited. It passes `OCP_VERSION` and digest-pinned `EE_BASE_IMAGE` build arguments.
+Verified archives are mounted read-only during extraction and are not copied into
+image layers.
 Direct `ansible-builder build` in the source directory is no longer the supported
 entry point: its required verified release files are staged by the helper.
 
@@ -57,12 +87,14 @@ installer and client versions, an immutable amd64 release payload, the exact
 pushes the verified image ID, then records each successful tag and digest. A
 partial publication preserves completed pushes; do not blindly retry a receipt
 with existing push evidence. The receipt records archive checksums, source SHA,
-base digest, release payload, and run identity. Failed build output remains in
+base digest, release payload, stream, selected definition, mirror root, and run
+identity. Stream-aware receipts use schema version 2; older receipts must be
+rebuilt and verified with this helper before publication. Failed build output remains in
 `build.log`; unverified builds cannot publish.
 
 ## Verification and automation
 
-python3 -m unittest discover -s tests -p test_ocp_ee.py -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 The dedicated test workflow requires the CI-pinned Builder and renders a real
 Containerfile with fixture archives, without building an image or using a

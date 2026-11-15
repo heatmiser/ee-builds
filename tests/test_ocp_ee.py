@@ -32,9 +32,10 @@ def installer(version="4.22.22"):
 
 
 class Mirror:
-    def __init__(self, bad_archive=False):
+    def __init__(self, bad_archive=False, version="4.22.22"):
         self.urls = []
         self.bad_archive = bad_archive
+        self.version = version
         self.archives = {name: (name + " fixture bytes").encode() for name in EE.ARCHIVES}
         self.manifest = "".join(f"{hashlib.sha256(value).hexdigest()}  {name}\n"
                                 for name, value in self.archives.items())
@@ -42,7 +43,7 @@ class Mirror:
     def __call__(self, url, timeout):
         self.urls.append(url)
         if url.endswith("/release.txt"):
-            data = b"Name: 4.22.22\nArchitecture: amd64\n"
+            data = f"Name: {self.version}\nArchitecture: amd64\n".encode()
         elif url.endswith("/sha256sum.txt"):
             data = self.manifest.encode()
         else:
@@ -86,11 +87,58 @@ class Runner:
 class VersionSelectionTests(unittest.TestCase):
     def test_matrix_validates_entire_input_before_builds(self):
         self.assertEqual(EE.release_matrix("4.22.14, 4.22.22"),
-                         {"include": [{"release": "4.22.14"}, {"release": "4.22.22"}]})
+                         {"include": [{"release": "4.22.14", "stream": "4.22"},
+                                      {"release": "4.22.22", "stream": "4.22"}]})
         for value in ("", "4.22.22,", "4.22.22,4.22.22", "stable-4.22", "4.21.22",
                       "4.22.022", "4.22.22;touch /tmp/file", "4.22.22\n4.22.14"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 EE.release_matrix(value)
+
+    def test_configured_minor_and_major_streams_keep_patch_only_tags(self):
+        versions = ("4.22.22", "4.22.14", "5.0.0")
+        entries = EE.release_matrix(",".join(versions))["include"]
+        self.assertEqual([entry["stream"] for entry in entries], ["4.22", "4.22", "5.0"])
+        for version in versions:
+            stream, patch = version.rsplit(".", 1)
+            self.assertEqual(EE.image_name(version), "dcm-ocp-ee-" + stream)
+            self.assertEqual(EE.image_tags(version, version, COMMIT, "123-1")[-1], patch)
+            self.assertNotIn("latest", EE.image_tags(version, version, COMMIT, "123-1"))
+            self.assertEqual(EE.image_tags(version, "stable-" + stream, COMMIT, "123-1")[-2:],
+                             [patch, "latest"])
+            self.assertEqual(len(EE.image_tags(version, "stable-" + stream, COMMIT, "123-1", "65")), 1)
+            with self.assertRaises(ValueError):
+                EE.image_tags(version, "stable-6.0", COMMIT, "123-1")
+        for invalid in ("04.22.14", "5.00.0", "5.0.00", "5.0", "5.0.0-rc.1", "4.23.1", "6.0.0"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                EE.release_matrix(invalid)
+
+    def test_automatic_streams_require_explicit_configuration(self):
+        config = EE.configuration()
+        self.assertEqual(set(config["streams"]), {"4.22", "5.0"})
+        matrix = EE.automation_matrix()["include"]
+        self.assertEqual([entry["ocp_version"] for entry in matrix if entry["versioned"]], ["4.22"])
+        self.assertEqual([entry["ocp_version"] for entry in matrix if not entry["versioned"]],
+                         config["legacy_streams"])
+        config["streams"]["6.1"] = {"definition": "dcm-ocp-ee-4.22", "automatic": True}
+        with patch.object(EE, "configuration", return_value=config):
+            self.assertEqual(EE.image_name("6.1.2"), "dcm-ocp-ee-6.1")
+            self.assertIn({"ocp_version": "6.1", "versioned": True}, EE.automation_matrix()["include"])
+
+    def test_invalid_stream_configuration_fails_before_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "streams.json"
+            for key, value in (("mirror_root", "http://example.test/ocp"),
+                               ("definition", "../outside"), ("automatic", "true")):
+                config = EE.configuration()
+                if key == "mirror_root":
+                    config[key] = value
+                else:
+                    config["streams"]["5.0"][key] = value
+                path.write_text(json.dumps(config))
+                mirror = Mirror(version="5.0.0")
+                with patch.object(EE, "CONFIG", path), self.assertRaises(ValueError):
+                    EE.resolve_release("stable-5.0", mirror)
+                self.assertEqual(mirror.urls, [])
 
     def test_patch_tags_and_unique_build_identity(self):
         tags = EE.image_tags("4.22.14", "4.22.14", COMMIT, "123-1")
@@ -113,6 +161,24 @@ class VersionSelectionTests(unittest.TestCase):
             EE.stage_archives("4.22.22", Path(directory) / "release", mirror)
         self.assertEqual(sum("stable-4.22" in url for url in mirror.urls), 1)
         self.assertTrue(all("/4.22.22/" in url for url in mirror.urls[1:]))
+
+    def test_new_stream_stable_resolution_keeps_configured_mirror_prefix(self):
+        for version in ("4.22.14", "5.0.0"):
+            stream = version.rsplit(".", 1)[0]
+            mirror = Mirror(version=version)
+            self.assertEqual(EE.resolve_release("stable-" + stream, mirror), version)
+            with tempfile.TemporaryDirectory() as directory:
+                EE.stage_archives(version, Path(directory) / "release", mirror)
+            root = EE.configuration()["mirror_root"]
+            self.assertEqual(mirror.urls[0], root + "/stable-" + stream + "/release.txt")
+            self.assertTrue(all(url.startswith(root + "/" + version + "/") for url in mirror.urls[1:]))
+            self.assertIn("/openshift-v4/", mirror.urls[0])
+        with self.assertRaisesRegex(ValueError, "differs from requested stream"):
+            EE.resolve_release("stable-5.0", Mirror(version="4.22.14"))
+        mirror = Mirror()
+        with self.assertRaises(ValueError):
+            EE.resolve_release("stable-4.23", mirror)
+        self.assertEqual(mirror.urls, [])
 
     def test_missing_or_duplicate_archive_checksums_are_rejected(self):
         manifest = Mirror().manifest
@@ -183,7 +249,53 @@ class BuildAndPublishTests(unittest.TestCase):
         pushes = [argv for argv in runner.commands if argv[:2] == ["podman", "push"]]
         self.assertEqual([argv[-1].rsplit(":", 1)[1] for argv in pushes], ["22-aaaaaaaaaaaa-123-1", "22"])
         self.assertTrue(all(argv[-2] == IMAGE_ID for argv in pushes))
-        self.assertEqual(result["published_image"], "quay.io/s4v0/" + EE.IMAGE + "@" + DIGEST)
+        self.assertEqual(result["published_image"], "quay.io/s4v0/" + EE.image_name("4.22.22") + "@" + DIGEST)
+
+    def test_cross_stream_builds_and_publication_use_matching_repositories(self):
+        for version in ("4.22.14", "5.0.0"):
+            with self.subTest(version=version):
+                runner = Runner(version=version, client=version)
+                receipt = EE.build(version, BASE, COMMIT, "123-1",
+                                   Path(self.temporary.name) / version, run=runner, opener=Mirror(version=version))
+                record = json.loads(receipt.read_text())
+                stream = version.rsplit(".", 1)[0]
+                self.assertEqual(record["stream"], stream)
+                self.assertEqual(record["definition"], EE.stream_settings(stream)["definition"])
+                result = EE.publish(receipt, "quay.io/s4v0", runner)
+                self.assertEqual(result["published_image"], f"quay.io/s4v0/dcm-ocp-ee-{stream}@{DIGEST}")
+                pushes = [argv for argv in runner.commands if argv[:2] == ["podman", "push"]]
+                self.assertTrue(all(f"/dcm-ocp-ee-{stream}:" in argv[-1] for argv in pushes))
+
+    def test_definition_selection_is_independent_of_output_repository(self):
+        workspace = Path(self.temporary.name) / "workspace"
+        definition = "dcm-ocp-ee-custom"
+        shutil.copytree(ROOT / "dcm-ocp-ee-4.22", workspace / definition)
+        (workspace / definition / "selected-definition.txt").write_text("custom stream definition\n")
+        config = EE.configuration()
+        config["legacy_streams"] = []
+        config["streams"] = {"5.0": {"definition": definition, "automatic": False}}
+        config_path = workspace / "streams.json"
+        config_path.write_text(json.dumps(config))
+        with patch.object(EE, "ROOT", workspace), patch.object(EE, "CONFIG", config_path):
+            receipt = EE.build("5.0.0", BASE, COMMIT, "123-1", self.output,
+                               run=Runner(version="5.0.0", client="5.0.0"), opener=Mirror(version="5.0.0"))
+        record = json.loads(receipt.read_text())
+        self.assertEqual(record["definition"], definition)
+        self.assertTrue(record["image"].startswith("localhost/dcm-ocp-ee-5.0:"))
+        self.assertEqual((self.output / "source/selected-definition.txt").read_text(),
+                         "custom stream definition\n")
+
+    def test_receipt_cannot_cross_stream_or_repository_boundaries(self):
+        receipt, _ = self.build()
+        original = json.loads(receipt.read_text())
+        for key, value in (("stream", "5.0"), ("image", "localhost/dcm-ocp-ee-5.0:0")):
+            record = dict(original)
+            record[key] = value
+            EE.write_receipt(receipt, record)
+            runner = Runner()
+            with self.assertRaises(ValueError):
+                EE.publish(receipt, "quay.io/s4v0", runner)
+            self.assertEqual(runner.commands, [])
 
     def test_build_and_publication_normalize_bare_and_prefixed_image_ids(self):
         for index, image_id in enumerate((IMAGE_ID, "sha256:" + IMAGE_ID)):
@@ -265,21 +377,25 @@ class BuildAndPublishTests(unittest.TestCase):
             if os.environ.get("REQUIRE_BUILDER") == "1":
                 self.fail("CI requires the pinned ansible-builder")
             self.skipTest("ansible-builder not installed; CI requires this render check")
-        self.build()
-        result = subprocess.run(["ansible-builder", "create", "--file", "execution-environment.yml",
-                                 "--output-filename", "Containerfile",
-                                 "--context", str(self.output / "rendered"), "--verbosity=3"],
-                                cwd=self.output / "source", capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        containerfile = (self.output / "rendered/Containerfile").read_text()
-        self.assertIn("ARG OCP_VERSION", containerfile)
-        self.assertIn("RUN --mount=type=bind,source=_build/ocp-release,target=/tmp/ocp-release,ro ", containerfile)
-        self.assertNotIn("COPY _build/ocp-release", containerfile)
-        self.assertNotIn("rm -rf /tmp/ocp-release", containerfile)
-        self.assertIn("sha256sum -c SHA256SUMS && tar xzf openshift-client-linux.tar.gz", containerfile)
-        self.assertIn('LABEL ocp.version="$OCP_VERSION"', containerfile)
-        for name in (*EE.ARCHIVES, "SHA256SUMS"):
-            self.assertTrue((self.output / "rendered/_build/ocp-release" / name).is_file())
+        for version in ("4.22.22", "4.22.14", "5.0.0"):
+            with self.subTest(version=version):
+                output = Path(self.temporary.name) / version
+                EE.build(version, BASE, COMMIT, "123-1", output,
+                         run=Runner(version=version, client=version), opener=Mirror(version=version))
+                result = subprocess.run(["ansible-builder", "create", "--file", "execution-environment.yml",
+                                         "--output-filename", "Containerfile",
+                                         "--context", str(output / "rendered"), "--verbosity=3"],
+                                        cwd=output / "source", capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                containerfile = (output / "rendered/Containerfile").read_text()
+                self.assertIn("ARG OCP_VERSION", containerfile)
+                self.assertIn("RUN --mount=type=bind,source=_build/ocp-release,target=/tmp/ocp-release,ro ", containerfile)
+                self.assertNotIn("COPY _build/ocp-release", containerfile)
+                self.assertNotIn("rm -rf /tmp/ocp-release", containerfile)
+                self.assertIn("sha256sum -c SHA256SUMS && tar xzf openshift-client-linux.tar.gz", containerfile)
+                self.assertIn('LABEL ocp.version="$OCP_VERSION"', containerfile)
+                for name in (*EE.ARCHIVES, "SHA256SUMS"):
+                    self.assertTrue((output / "rendered/_build/ocp-release" / name).is_file())
 
 
 class WorkflowTests(unittest.TestCase):
@@ -289,20 +405,31 @@ class WorkflowTests(unittest.TestCase):
         build = workflow["jobs"]["build"]
         self.assertEqual(build["needs"], "prepare")
         self.assertEqual(build["strategy"]["max-parallel"], 1)
+        self.assertEqual(build["concurrency"]["group"], "ocp-ee-${{ matrix.stream }}-production")
         command = next(step for step in build["steps"] if step["name"] == "Build and verify selected release")
         self.assertEqual(command["env"]["OCP_BASE"], "${{ needs.prepare.outputs.base }}")
         self.assertNotIn("${{ inputs.", command["run"])
 
-    def test_legacy_push_cannot_publish_four_twenty_two(self):
+    def test_legacy_push_cannot_publish_versioned_streams(self):
         for filename in ("pr-ee-build.yml", "push-ee-build.yml"):
             workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
             steps = workflow["jobs"]["build-ocp-ees"]["steps"]
             for step in steps:
                 if step["name"] in ("Build image", "Push To GHCR", "Push To quay.io"):
-                    self.assertEqual(step["if"], "matrix.ocp_version != '4.22'")
-            special = next(step for step in steps if step["name"] == "Build and verify exact stable OpenShift 4.22 release")
-            self.assertEqual(special["if"], "matrix.ocp_version == '4.22'")
-            self.assertIn("--release stable-4.22", special["run"])
+                    self.assertEqual(step["if"], "${{ !matrix.versioned }}")
+            special = next(step for step in steps if step["name"] == "Build and verify configured stable OpenShift release")
+            self.assertEqual(special["if"], "matrix.versioned")
+            self.assertIn('--release "stable-$OCP_STREAM"', special["run"])
+            self.assertEqual(special["env"]["OCP_STREAM"], "${{ matrix.ocp_version }}")
+            self.assertEqual(workflow["jobs"]["build-ocp-ees"]["strategy"]["matrix"],
+                             "${{ fromJson(needs.prepare-matrix.outputs.ocp_matrix) }}")
+            prepare = workflow["jobs"]["prepare-matrix"]
+            self.assertIn("ocp_matrix", prepare["outputs"])
+            self.assertTrue(any("automation-matrix" in step.get("run", "") for step in prepare["steps"]))
+
+    def test_stream_configuration_changes_trigger_validation(self):
+        workflow = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       length: ${{ steps.set-matrix.outputs.length }}
+      ocp_matrix: ${{ steps.ocp-matrix.outputs.matrix }}
     steps:
     - name: Checkout repo
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -49,11 +50,17 @@ jobs:
       env:
         EE_NAME: ${{ inputs.ee_name }}
       run: |
-        if [ "$EE_NAME" = dcm-ocp-ee-4.22 ]; then
-          echo "Use Versioned OpenShift 4.22 EE Build for this image." >&2
+        if python3 -c 'import json, os, sys; streams = json.load(open(".github/ocp-ee-streams.json"))["streams"]; sys.exit(0 if os.environ["EE_NAME"] in {"dcm-ocp-ee-" + stream for stream in streams} else 1)'; then
+          echo "Use Versioned OpenShift EE Build for this image." >&2
           exit 1
         fi
         python3 -c 'import json, os; print(json.dumps({"include": [{"ee": os.environ["EE_NAME"]}]}))' > matrix_output.json
+
+    - name: Prepare dependent OpenShift stream matrix
+      id: ocp-matrix
+      run: |
+        MATRIX=$(python3 .github/scripts/ocp_ee.py automation-matrix)
+        echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
 
     - name: Read matrix
       id: set-matrix
@@ -196,8 +203,7 @@ jobs:
       group: ocp-ee-${{ matrix.ocp_version }}-production
       cancel-in-progress: false
     strategy:
-      matrix:
-        ocp_version: ['4.16', '4.17', '4.18', '4.19', '4.20', '4.21', '4.22']
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.ocp_matrix) }}
       fail-fast: false
     steps:
       - name: Checkout repo
@@ -214,6 +220,7 @@ jobs:
           echo "IMAGE_TAG=latest" >> $GITHUB_ENV
 
       - name: Substitute quay username in base EE reference
+        if: ${{ !matrix.versioned }}
         run: |
           sed -i "s/my_quay_username/${{ secrets.QUAY_USERNAME }}/1" \
             dcm-ocp-ee-${{ matrix.ocp_version }}/execution-environment.yml
@@ -236,7 +243,7 @@ jobs:
         run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
 
       - name: Build image
-        if: matrix.ocp_version != '4.22'
+        if: ${{ !matrix.versioned }}
         working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
         run: |
           ansible-builder build -v 3 \
@@ -245,38 +252,40 @@ jobs:
           --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
           --tag=${{ env.EE }}:${{ github.sha }}
 
-      - name: Build and verify exact stable OpenShift 4.22 release
-        if: matrix.ocp_version == '4.22'
+      - name: Build and verify configured stable OpenShift release
+        if: matrix.versioned
         env:
+          OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_BASE: quay.io/${{ secrets.QUAY_USERNAME }}/dcm-base-ee:latest
           SOURCE_COMMIT: ${{ github.sha }}
           BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           python3 .github/scripts/ocp_ee.py build \
-            --release stable-4.22 --base "$OCP_BASE" \
+            --release "stable-$OCP_STREAM" --base "$OCP_BASE" \
             --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" \
-            --output "$RUNNER_TEMP/ocp-ee-4.22"
+            --output "$RUNNER_TEMP/ocp-ee-$OCP_STREAM"
 
-      - name: Publish verified OpenShift 4.22 image
-        if: matrix.ocp_version == '4.22'
+      - name: Publish verified OpenShift image
+        if: matrix.versioned
         env:
+          OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
-            --receipt "$RUNNER_TEMP/ocp-ee-4.22/receipt.json" --registry "$OCP_REGISTRY"
+            --receipt "$RUNNER_TEMP/ocp-ee-$OCP_STREAM/receipt.json" --registry "$OCP_REGISTRY"
 
-      - name: Preserve OpenShift 4.22 build receipt
-        if: always() && matrix.ocp_version == '4.22'
+      - name: Preserve OpenShift build receipt
+        if: always() && matrix.versioned
         uses: actions/upload-artifact@v4
         with:
-          name: ocp-ee-4.22-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ocp-ee-${{ matrix.ocp_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/ocp-ee-4.22/receipt.json
-            ${{ runner.temp }}/ocp-ee-4.22/build.log
+            ${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json
+            ${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/build.log
           if-no-files-found: ignore
 
       - name: Push To quay.io
-        if: matrix.ocp_version != '4.22'
+        if: ${{ !matrix.versioned }}
         uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
         with:
           image: ${{ env.EE }}
@@ -286,7 +295,7 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
 
       - name: Print summary
-        if: matrix.ocp_version != '4.22'
+        if: ${{ !matrix.versioned }}
         run: |
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY

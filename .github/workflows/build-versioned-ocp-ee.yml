@@ -1,11 +1,11 @@
 ---
-name: Versioned OpenShift 4.22 EE Build
+name: Versioned OpenShift EE Build
 
 on:
   workflow_dispatch:
     inputs:
       versions:
-        description: "Comma-separated exact releases, e.g. 4.22.14,4.22.22"
+        description: "Comma-separated exact releases from configured streams, e.g. 4.22.22,5.0.0"
         required: true
         default: "4.22.22"
         type: string
@@ -57,7 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: deploy
     concurrency:
-      group: ocp-ee-4.22-production
+      group: ocp-ee-${{ matrix.stream }}-production
       cancel-in-progress: false
     strategy:
       fail-fast: false
@@ -94,14 +94,15 @@ jobs:
           python3 .github/scripts/ocp_ee.py build \
             --release "$OCP_RELEASE" --base "$OCP_BASE" \
             --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" \
-            --output "$RUNNER_TEMP/ocp-ee-4.22"
+            --output "$RUNNER_TEMP/ocp-ee-$OCP_RELEASE"
 
       - name: Publish patch and build tags
         env:
+          OCP_RELEASE: ${{ matrix.release }}
           OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
-            --receipt "$RUNNER_TEMP/ocp-ee-4.22/receipt.json" --registry "$OCP_REGISTRY"
+            --receipt "$RUNNER_TEMP/ocp-ee-$OCP_RELEASE/receipt.json" --registry "$OCP_REGISTRY"
 
       - name: Preserve build receipt
         if: always()
@@ -109,7 +110,7 @@ jobs:
         with:
           name: ocp-ee-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/ocp-ee-4.22/receipt.json
-            ${{ runner.temp }}/ocp-ee-4.22/build.log
+            ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json
+            ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/build.log
           if-no-files-found: ignore
 ...

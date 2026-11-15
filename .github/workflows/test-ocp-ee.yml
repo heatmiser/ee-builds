@@ -5,6 +5,7 @@ on:
   pull_request:
     paths:
       - ".github/scripts/ocp_ee.py"
+      - ".github/ocp-ee-streams.json"
       - ".github/workflows/build-versioned-ocp-ee.yml"
       - ".github/workflows/test-ocp-ee.yml"
       - ".github/workflows/generate_image_matrix.py"

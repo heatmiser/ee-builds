@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and publish verified OpenShift 4.22 EEs with patch-only tags.
+"""Build and publish configured OpenShift release streams with patch-only tags.
 
 Network, container builds and publication are explicit subcommands. Unit tests
 inject the downloader and command runner; importing this module has no effects.
@@ -15,11 +15,12 @@ import re
 import shutil
 import subprocess
 import urllib.request
+from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MIRROR = "https://mirror.openshift.com/pub/openshift-v4/clients/ocp"
-IMAGE = "dcm-ocp-ee-4.22"
+CONFIG = ROOT / ".github/ocp-ee-streams.json"
+STREAM_PATTERN = r"[1-9][0-9]*\.(?:0|[1-9][0-9]*)"
 ARCHIVES = ("openshift-client-linux.tar.gz", "openshift-install-linux.tar.gz")
 
 
@@ -28,17 +29,68 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def configuration():
+    config = json.loads(CONFIG.read_text())
+    require(isinstance(config, dict), "Require an OpenShift stream configuration")
+    mirror = config.get("mirror_root")
+    require(isinstance(mirror, str), "Require an HTTPS mirror root")
+    parsed = urlsplit(mirror)
+    require(parsed.scheme == "https" and bool(parsed.netloc) and parsed.username is None
+            and parsed.password is None and not parsed.query and not parsed.fragment,
+            "Require an HTTPS mirror root without credentials, query or fragment")
+    streams, legacy = config.get("streams"), config.get("legacy_streams")
+    require(isinstance(streams, dict) and bool(streams) and isinstance(legacy, list),
+            "Require configured streams and a legacy stream list")
+    for stream, settings in streams.items():
+        require(re.fullmatch(STREAM_PATTERN, stream) and isinstance(settings, dict), "Invalid configured stream")
+        definition = settings.get("definition")
+        require(isinstance(definition, str) and re.fullmatch(r"dcm-ocp-ee-[A-Za-z0-9_.-]+", definition),
+                "Require a repository-local EE definition directory")
+        require((ROOT / definition / "execution-environment.yml").is_file(), "Configured EE definition is absent")
+        require(type(settings.get("automatic")) is bool, "Require an explicit automatic-build flag")
+    require(all(isinstance(stream, str) and re.fullmatch(STREAM_PATTERN, stream) for stream in legacy)
+            and len(set(legacy)) == len(legacy) and not set(legacy).intersection(streams),
+            "Legacy streams must be distinct from configured versioned streams")
+    return config
+
+
+def stream_settings(stream):
+    config = configuration()
+    require(stream in config["streams"], f"OpenShift stream is not configured: {stream}")
+    return config["streams"][stream]
+
+
 def release_version(value):
-    require(isinstance(value, str) and re.fullmatch(r"4\.22\.(0|[1-9][0-9]*)", value),
-            "Expected an exact OpenShift 4.22 patch release, for example 4.22.22")
+    require(isinstance(value, str) and re.fullmatch(STREAM_PATTERN + r"\.(?:0|[1-9][0-9]*)", value),
+            "Expected an exact OpenShift major.minor.patch release")
     return value
+
+
+def release_stream(version):
+    return release_version(version).rsplit(".", 1)[0]
+
+
+def image_name(version):
+    stream = release_stream(version)
+    stream_settings(stream)
+    return f"dcm-ocp-ee-{stream}"
+
+
+def automation_matrix():
+    config = configuration()
+    entries = [{"ocp_version": stream, "versioned": False} for stream in config["legacy_streams"]]
+    entries += [{"ocp_version": stream, "versioned": True}
+                for stream, settings in config["streams"].items() if settings["automatic"]]
+    return {"include": entries}
 
 
 def release_matrix(value):
     versions = [release_version(part.strip()) for part in value.split(",")]
     require(1 <= len(versions) <= 16 and len(set(versions)) == len(versions),
             "Supply 1-16 distinct exact releases")
-    return {"include": [{"release": version} for version in versions]}
+    for version in versions:
+        stream_settings(release_stream(version))
+    return {"include": [{"release": version, "stream": release_stream(version)} for version in versions]}
 
 
 def read_metadata(url, opener=urllib.request.urlopen):
@@ -49,12 +101,20 @@ def read_metadata(url, opener=urllib.request.urlopen):
 
 
 def resolve_release(selection, opener=urllib.request.urlopen):
-    if selection != "stable-4.22":
-        return release_version(selection)
-    metadata = read_metadata(f"{MIRROR}/stable-4.22/release.txt", opener)
-    matches = re.findall(r"(?m)^Name:\s*(4\.22\.[0-9]+)\s*$", metadata)
-    require(len(matches) == 1, "Stable release metadata must identify one exact 4.22 release")
-    return release_version(matches[0])
+    stable = re.fullmatch(r"stable-(" + STREAM_PATTERN + r")", selection)
+    if not stable:
+        version = release_version(selection)
+        stream_settings(release_stream(version))
+        return version
+    stream = stable[1]
+    stream_settings(stream)
+    mirror = configuration()["mirror_root"].rstrip("/")
+    metadata = read_metadata(f"{mirror}/{selection}/release.txt", opener)
+    matches = re.findall(r"(?m)^Name:[ \t]*(\S+)[ \t]*$", metadata)
+    require(len(matches) == 1, "Stable release metadata must identify one exact release")
+    version = release_version(matches[0])
+    require(release_stream(version) == stream, "Stable metadata differs from requested stream")
+    return version
 
 
 def checksums(metadata):
@@ -70,11 +130,13 @@ def checksums(metadata):
 
 def stage_archives(version, destination, opener=urllib.request.urlopen):
     version = release_version(version)
-    expected = checksums(read_metadata(f"{MIRROR}/{version}/sha256sum.txt", opener))
+    stream_settings(release_stream(version))
+    mirror = configuration()["mirror_root"].rstrip("/")
+    expected = checksums(read_metadata(f"{mirror}/{version}/sha256sum.txt", opener))
     destination.mkdir(parents=True, exist_ok=False)
     for name in ARCHIVES:
         digest, size = hashlib.sha256(), 0
-        with opener(f"{MIRROR}/{version}/{name}", timeout=60) as response:
+        with opener(f"{mirror}/{version}/{name}", timeout=60) as response:
             with (destination / name).open("xb") as stream:
                 while block := response.read(1024 * 1024):
                     size += len(block)
@@ -88,14 +150,15 @@ def stage_archives(version, destination, opener=urllib.request.urlopen):
 
 def image_tags(version, selection, commit, run_id, pr=""):
     patch = release_version(version).rsplit(".", 1)[1]
-    require(selection in (version, "stable-4.22"), "Release differs from build selection")
+    stable_selection = f"stable-{release_stream(version)}"
+    require(selection in (version, stable_selection), "Release differs from build selection")
     require(re.fullmatch(r"[a-f0-9]{40}", commit), "Require full source commit SHA")
     require(re.fullmatch(r"[0-9]+-[0-9]+", run_id), "Require run-id and attempt, for example 12345-1")
     if pr:
         require(re.fullmatch(r"[1-9][0-9]*", pr), "Invalid PR number")
         return [f"{patch}-pr-{pr}-{commit[:12]}-{run_id}"]
     tags = [f"{patch}-{commit[:12]}-{run_id}", patch]
-    if selection == "stable-4.22":
+    if selection == stable_selection:
         tags.append("latest")
     return tags
 
@@ -146,16 +209,19 @@ def normalize_image_id(value):
 
 def build(selection, base, commit, run_id, output, pr="", run=execute, opener=urllib.request.urlopen):
     version = resolve_release(selection, opener)
+    stream = release_stream(version)
+    settings = stream_settings(stream)
+    image = image_name(version)
     tags = image_tags(version, selection, commit, run_id, pr)
     require(run(["git", "rev-parse", "HEAD"], cwd=ROOT).strip() == commit,
             "Source checkout differs from requested commit")
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     source = output / "source"
-    shutil.copytree(ROOT / IMAGE, source)
+    shutil.copytree(ROOT / settings["definition"], source)
     archive_hashes = stage_archives(version, source / "files/release", opener)
     base_digest = pinned_base(base, run)
-    local_image = f"localhost/{IMAGE}:{tags[0]}"
+    local_image = f"localhost/{image}:{tags[0]}"
     # --unsetlabel also removes the expiry inherited from dcm-base-ee.
     run(["ansible-builder", "build", "--container-runtime=podman", "--verbosity=3",
          "--file", "execution-environment.yml", "--context", str(output / "context"),
@@ -169,7 +235,9 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
     labels = json.loads(run(["podman", "image", "inspect", "--format", "{{json .Config.Labels}}", image_id]))
     require(not labels.get("quay.expires-after") and labels.get("ocp.version") == version,
             "Final release image must record its version and have no expiry label")
-    record = {"schema_version": 1, "verified": True, "selection": selection, "release": version,
+    record = {"schema_version": 2, "verified": True, "selection": selection, "release": version,
+              "stream": stream, "definition": settings["definition"],
+              "mirror_root": configuration()["mirror_root"],
               "image": local_image, "image_id": image_id, "tags": tags, "pr": pr,
               "commit": commit, "run_id": run_id, "base_image": base_digest,
               "archive_sha256": archive_hashes, "release_image": payload,
@@ -181,9 +249,12 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
 def publish(receipt, registry, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+", registry), "Invalid image registry namespace")
     record = json.loads(receipt.read_text())
-    require(record.get("schema_version") == 1 and record.get("verified") is True, "Require a verified build receipt")
+    require(record.get("schema_version") == 2 and record.get("verified") is True, "Require a verified v2 build receipt")
+    image = image_name(record["release"])
+    require(record["stream"] == release_stream(record["release"]), "Receipt stream differs from release")
     require(record["tags"] == image_tags(record["release"], record["selection"], record["commit"],
                                         record["run_id"], record["pr"]), "Receipt tags differ from build selection")
+    require(record["image"] == f"localhost/{image}:{record['tags'][0]}", "Receipt image differs from release")
     require(bool(record["pr"]) == registry.startswith("ghcr.io/"), "PR builds publish only to GHCR; releases only to Quay")
     record["image_id"] = normalize_image_id(record["image_id"])
     # Recheck immutable local content before any tag can reach a registry.
@@ -192,7 +263,7 @@ def publish(receipt, registry, run=execute):
     require(verify_tools(record["release"], installer, client) == record["release_image"], "Release payload changed")
     destinations, expected_digest = [], None
     for index, tag in enumerate(record["tags"]):
-        destination = f"{registry}/{IMAGE}:{tag}"
+        destination = f"{registry}/{image}:{tag}"
         digestfile = receipt.parent / f"push-{index}.digest"
         require(not digestfile.exists(), "Push evidence already exists; inspect the previous publication")
         run(["podman", "push", "--digestfile", str(digestfile), record["image_id"], f"docker://{destination}"])
@@ -201,7 +272,7 @@ def publish(receipt, registry, run=execute):
         require(expected_digest in (None, digest), "Published tag digests differ")
         expected_digest = digest
         destinations.append(destination)
-        record.update(published_tags=destinations, published_image=f"{registry}/{IMAGE}@{digest}")
+        record.update(published_tags=destinations, published_image=f"{registry}/{image}@{digest}")
         write_receipt(receipt, record)
     return record
 
@@ -212,6 +283,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     matrix = commands.add_parser("matrix")
     matrix.add_argument("--versions", required=True)
+    commands.add_parser("automation-matrix")
     base = commands.add_parser("resolve-base")
     base.add_argument("--reference", required=True)
     builder = commands.add_parser("build")
@@ -226,6 +298,8 @@ def main():
     try:
         if args.command == "matrix":
             print(json.dumps(release_matrix(args.versions)))
+        elif args.command == "automation-matrix":
+            print(json.dumps(automation_matrix()))
         elif args.command == "resolve-base":
             print(pinned_base(args.reference))
         elif args.command == "build":
