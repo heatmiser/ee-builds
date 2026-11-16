@@ -57,7 +57,9 @@ jobs:
 
   build-image:
     needs: [prepare-matrix]
-    if: ${{ needs.prepare-matrix.outputs.length != '0' }}
+    # Temporary gate until production image publication is separately qualified.
+    # Re-enable only after explicit review of the remaining publication paths.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     environment: deploy
     strategy:
