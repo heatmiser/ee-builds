@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and verify before handing local tags to the workflow's publisher.
+# Keep raw evidence local; export only validated provenance for publication.
 set -euo pipefail
 umask 077
 
@@ -29,62 +29,42 @@ artifact_root="$artifact_parent/$(basename -- "$artifact_root")"
 # A fresh directory prevents stale successful receipts from authorizing tags.
 mkdir -m 0700 -- "$artifact_root"
 
+stage=setup
+
 finish() {
   local result=$?
   trap - EXIT
   set +e
   printf '%s\n' "$result" > "$artifact_root/ci-exit-code.txt"
-  # Preserve source symlinks, private modes and hidden files in one artifact.
-  if tar -czf "$artifact_root.tar.gz" -C "$artifact_root" .; then
-    (cd -- "$artifact_parent" && sha256sum "$(basename -- "$artifact_root").tar.gz") \
-      > "$artifact_root.tar.gz.sha256" || result=1
+  if ! python3 "$definition_root/public-evidence.py" export \
+    --results "$artifact_root" --workflow-commit "$workflow_commit" \
+    --stage "$stage" --exit-code "$result" > "$artifact_root/export.log" 2>&1; then
+    if [[ $result == 0 ]]; then result=1; fi
+  fi
+  if [[ $result == 0 ]]; then
+    echo 'L8K CI completed; validated public evidence prepared.'
   else
-    result=1
+    echo 'L8K CI failed; raw output suppressed. See bounded public evidence if available.' >&2
   fi
   exit "$result"
 }
 trap finish EXIT
 mkdir -m 0700 -- "$artifact_root/tests" "$artifact_root/builds"
 cd -- "$definition_root"
+stage=tests
 L8K_TEST_ROOT="$artifact_root/tests" \
-  python3 -m unittest discover -s tests -p test_build.py -v 2>&1 | tee "$artifact_root/tests.log"
-./build.sh --build --output-parent "$artifact_root/builds" 2>&1 | tee "$artifact_root/build.log"
+  python3 -m unittest discover -s tests -p 'test_*.py' -v > "$artifact_root/tests.log" 2>&1
+stage=build
+./build.sh --build --output-parent "$artifact_root/builds" > "$artifact_root/build.log" 2>&1
 
-# The build script verifies the immutable ID; never select an image by tag here.
-image_id=$(python3 - "$artifact_root/builds" <<'PY'
-import json
-from pathlib import Path
-import re
-import sys
-
-receipts = list(Path(sys.argv[1]).glob('l8k-build-*/receipt.json'))
-if len(receipts) != 1:
-    raise SystemExit('Expected exactly one fresh build receipt.')
-receipt = json.loads(receipts[0].read_text())
-if receipt.get('status') != 'LOCAL_BUILD_VERIFIED':
-    raise SystemExit('A verified build is required before tagging.')
-image = receipt.get('imageID', '')
-if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
-    raise SystemExit('Missing immutable image ID.')
-print(image)
-PY
-)
-podman tag "$image_id" "$image:$image_tag"
-podman tag "$image_id" "$image:$workflow_commit"
-
-python3 - "$artifact_root/builds" "$workflow_commit" > "commands-$image.txt" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-receipt = json.loads(next(Path(sys.argv[1]).glob('l8k-build-*/receipt.json')).read_text())
-print('### k8s-launch-kit\n')
-print(f'- Source version: {receipt["version"]}')
-print(f'- Source commit: {receipt["sourceRevision"]}')
-print(f'- Embedded build date: {receipt["buildDate"]}')
-print(f'- Verified local image ID: {receipt["imageID"]}')
-print(f'- Workflow commit: {sys.argv[2]}')
-print('- Checksummed build evidence: l8k-build-evidence artifact')
-print('\nRuntime qualification does not establish cluster deployment compatibility.')
-PY
-cp -- "commands-$image.txt" "$artifact_root/"
+# Validate the original receipt against the source lock before selecting an ID.
+stage=receipt
+python3 "$definition_root/public-evidence.py" image-id --results "$artifact_root" \
+  > "$artifact_root/image-id.txt" 2> "$artifact_root/receipt-check.log"
+image_id=$(< "$artifact_root/image-id.txt")
+stage=tag
+{
+  podman tag "$image_id" "$image:$image_tag"
+  podman tag "$image_id" "$image:$workflow_commit"
+} > "$artifact_root/tag.log" 2>&1
+stage=complete

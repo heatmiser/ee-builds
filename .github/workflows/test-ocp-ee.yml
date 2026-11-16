@@ -1,0 +1,42 @@
+---
+name: Test OpenShift EE Version Selection
+
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/ocp_ee.py"
+      - ".github/scripts/ci_report.py"
+      - ".github/ocp-ee-streams.json"
+      - ".github/workflows/build-versioned-ocp-ee.yml"
+      - ".github/workflows/pr-ocp-ee-build.yml"
+      - ".github/workflows/test-ocp-ee.yml"
+      - ".github/workflows/generate_image_matrix.py"
+      - ".github/workflows/pr-ee-build.yml"
+      - ".github/workflows/push-ee-build.yml"
+      - ".github/workflows/pr-image-build.yml"
+      - ".github/workflows/push-image-build.yml"
+      - "dcm-ocp-ee-4.22/**"
+      - "tests/test_ocp_ee.py"
+      - "tests/test_ci_report.py"
+      - "tests/test_generate_image_matrix.py"
+      - "requirements.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned Ansible Builder
+        run: pip install -r requirements.txt
+
+      - name: Test image routing, version selection and generated Containerfile without image builds
+        env:
+          REQUIRE_BUILDER: "1"
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+...

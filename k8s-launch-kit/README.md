@@ -72,11 +72,28 @@ ID for the existing publisher. PR builds publish to GHCR; production builds publ
 to Quay. Publication requires successful tests, compilation and runtime checks.
 The generic shell/toolbox checks are skipped for this distroless image.
 
-Changes anywhere under `k8s-launch-kit/` trigger the image workflows. The
-`l8k-build-evidence` artifact contains a checksummed archive of test/build logs,
-source inputs and receipts, including partial evidence after failure. Its build
-receipt describes verification before publication; it is not a registry digest or
-a publication receipt.
+Changes anywhere under `k8s-launch-kit/` trigger the image workflows. The PR image
+build job is temporarily disabled while public output and comment publication are
+hardened; re-enabling it requires explicit review.
+
+The `l8k-build-evidence` artifact contains only `receipt.json`, `summary.txt`,
+`commands-k8s-launch-kit.txt` and their `SHA256SUMS`, generated in
+`tmp/l8k-ci/public/`. `public-evidence.py` checks successful provenance against the
+source lock, validates the image ID/date/digests and selects explicit fields.
+Original receipts, command arguments, observed tool output and exception messages
+are excluded. Failures export only fixed status/stage/exit-code fields and the
+workflow commit. Invalid success metadata fails CI and exports a failure summary.
+The receipt precedes registry publication; it establishes no registry digest or
+cluster deployment compatibility.
+
+CI captures raw tests/build/tag output in the runner's local results directory;
+it does not stream that output or create a whole-directory archive. Raw logs,
+source trees, Git metadata, image inspection and test scratch are not uploaded by
+these L8K evidence steps. Local operator runs retain their results until explicitly
+removed; the scripts perform no automatic cleanup. Artifact retention is 7 days
+for PRs and 30 days for production, including the separate command-report upload.
+Retention does not govern PR comments or copies already downloaded. Other image
+workflows' login/push output and generic command reports require separate review.
 
 Use `build.sh` rather than direct `podman build`, which lacks the prepared context
 and required arguments. CI integration does not change the source or base-image
@@ -84,8 +101,10 @@ locks.
 
 ## Offline tests
 
-python3 -m unittest discover -s tests -p test_build.py -v
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 Tests mock Git and Podman; they do not download source or build images. Set
 L8K_TEST_ROOT to an existing artifact directory to override the default output
-location. Check build.sh with bash -n and ShellCheck.
+location. Publication tests run the shell wrapper/exporter with synthetic secrets
+and stand-ins for tests/build/Podman, covering success and failed stages without
+building containers. Check build.sh and ci-build.sh with bash -n and ShellCheck.

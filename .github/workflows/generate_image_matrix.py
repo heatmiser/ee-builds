@@ -77,11 +77,14 @@ def main():
         while current_dir != "":
             # Check for any of our trigger files in the current level
             if any(os.path.isfile(os.path.join(workspace, current_dir, t)) for t in TARGET_FILES):
-                if current_dir not in dirs:
-                    logger.info(f"Found build context at: {current_dir}")
-                    # only need the first directory no matter how deep in the path the modified file is found
-                    dirs.add(current_dir.split(os.sep)[0])
-                break  # Found the context for this file, stop climbing
+                # Both image workflows run podman build from the top-level directory.
+                # README/image metadata alone must not select an EE or documentation tree.
+                build_root = current_dir.split(os.sep)[0]
+                if os.path.isfile(os.path.join(workspace, build_root, "Containerfile")):
+                    if build_root not in dirs:
+                        logger.info(f"Found build context at: {build_root}")
+                        dirs.add(build_root)
+                break
 
             # Move to parent
             parent = os.path.dirname(current_dir)
@@ -89,7 +92,7 @@ def main():
                 break
             current_dir = parent
 
-    matrix = {'include': [{'image': dir_name} for dir_name in dirs]}
+    matrix = {'include': [{'image': dir_name} for dir_name in sorted(dirs)]}
     logger.info(f"Generated matrix: {json.dumps(matrix, indent=4)}")
 
     with open(args.output_path, 'w') as file:
