@@ -953,6 +953,7 @@ class WorkflowTests(unittest.TestCase):
                 "${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json",
             }),
             "build-versioned-ocp-ee.yml": ("30", {
+                "${{ runner.temp }}/ocp-ee-release-plan.json",
                 "${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json",
             }),
         }
@@ -988,14 +989,153 @@ class WorkflowTests(unittest.TestCase):
 
     def test_manual_workflow_uses_shared_digest_and_safe_input_binding(self):
         path = ROOT / ".github/workflows/build-versioned-ocp-ee.yml"
-        workflow = yaml.safe_load(path.read_text())
-        build = workflow["jobs"]["build"]
+        workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(set(workflow["on"]), {"workflow_dispatch"})
+        prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
+        self.assertEqual(prepare["outputs"], {"matrix": "${{ steps.prepare.outputs.matrix }}",
+                                              "plan_artifact": "${{ steps.prepare.outputs.plan_artifact }}"})
         self.assertEqual(build["needs"], "prepare")
-        self.assertEqual(build["strategy"]["max-parallel"], 1)
+        self.assertEqual(build["strategy"]["max-parallel"], "1")
         self.assertEqual(build["concurrency"]["group"], "ocp-ee-${{ matrix.stream }}-production")
+        self.assertEqual(prepare["environment"], "deploy")
+        self.assertEqual(build["environment"], "deploy")
         command = next(step for step in build["steps"] if step["name"] == "Build and verify selected release")
-        self.assertEqual(command["env"]["OCP_BASE"], "${{ needs.prepare.outputs.base }}")
+        self.assertNotIn("OCP_BASE", command["env"])
+        self.assertEqual(command["env"]["OCP_PLAN"],
+                         "${{ runner.temp }}/ocp-ee-release-plan/ocp-ee-release-plan.json")
+        self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.sha }}")
         self.assertNotIn("${{ inputs.", command["run"])
+        self.assertNotIn("needs.prepare.outputs.base", path.read_text())
+        publish = next(step for step in build["steps"] if step["name"] == "Publish patch and build tags")
+        self.assertEqual(publish["env"]["OCP_REGISTRY"], "quay.io/${{ secrets.QUAY_USERNAME }}")
+        self.assertNotIn("--pr", command["run"])
+
+    def test_manual_workflow_uses_captured_logins_and_preserves_credential_selection(self):
+        workflow = yaml.load((ROOT / ".github/workflows/build-versioned-ocp-ee.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        expected = {
+            "quay.io": ("${{ secrets.QUAY_USERNAME }}", "${{ secrets.QUAY_PASSWORD }}"),
+            "registry.redhat.io": ("${{ secrets.REDHAT_USERNAME }}", "${{ secrets.REDHAT_PASSWORD }}"),
+        }
+        for job_name, registries in (("prepare", ["quay.io"]),
+                                     ("build", ["quay.io", "registry.redhat.io"])):
+            steps = workflow["jobs"][job_name]["steps"]
+            logins = [step for step in steps if "registry-login" in step.get("run", "")]
+            self.assertEqual([step["run"].rsplit(" ", 1)[1] for step in logins], registries)
+            for registry, step in zip(registries, logins):
+                self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
+                self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+                self.assertNotIn("uses", step)
+            self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
+
+    def test_manual_plan_handoff_runs_shell_steps_without_base_output_and_supports_reruns(self):
+        workflow = yaml.load((ROOT / ".github/workflows/build-versioned-ocp-ee.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
+        prepare_command = next(step for step in prepare["steps"] if step.get("id") == "prepare")
+        self.assertEqual(prepare_command["env"], {"VERSIONS": "${{ inputs.versions }}",
+                                                  "BASE_IMAGE": "${{ inputs.base_image }}"})
+        upload = next(step for step in prepare["steps"] if step["name"] == "Preserve release plan")
+        self.assertEqual(upload["with"], {
+            "name": "ocp-ee-release-plan-${{ github.run_id }}-${{ github.run_attempt }}",
+            "path": "${{ runner.temp }}/ocp-ee-release-plan.json", "retention-days": "30",
+            "if-no-files-found": "error"})
+        download = next(step for step in build["steps"] if step["name"] == "Download prepared release plan")
+        self.assertEqual(download["uses"], "actions/download-artifact@v4")
+        self.assertEqual(download["with"], {"name": "${{ needs.prepare.outputs.plan_artifact }}",
+                                            "path": "${{ runner.temp }}/ocp-ee-release-plan"})
+        names = [step["name"] for step in build["steps"]]
+        self.assertLess(names.index(download["name"]), names.index("Build and verify selected release"))
+        command = next(step for step in build["steps"] if step["name"] == "Build and verify selected release")["run"]
+        matrix = {"include": [{"release": version, "stream": version.rsplit(".", 1)[0]}
+                              for version in ("4.22.22", "5.0.1")]}
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            executable = parent / "python3"
+            executable.write_text(f'''#!{sys.executable}
+import json, os, sys
+from pathlib import Path
+if sys.argv[1:] == ["-"]:
+    os.execv(sys.executable, [sys.executable, "-"])
+elif sys.argv[1:3] == [".github/scripts/ocp_ee.py", "matrix"]:
+    print({json.dumps(matrix)!r})
+elif sys.argv[1:3] == [".github/scripts/ocp_ee.py", "resolve-base"]:
+    print({BASE!r})
+elif sys.argv[1:3] == [".github/scripts/ocp_ee.py", "build"]:
+    Path(os.environ["RECORDED_ARGS"]).write_text(json.dumps(sys.argv[3:]))
+else:
+    raise SystemExit("Unexpected helper invocation")
+''')
+            executable.chmod(0o700)
+            target = parent / "github-output"
+            environment = dict(os.environ, PATH=directory + os.pathsep + os.environ["PATH"],
+                               RUNNER_TEMP=directory, GITHUB_OUTPUT=str(target), GITHUB_RUN_ID="12345",
+                               GITHUB_RUN_ATTEMPT="1", VERSIONS="4.22.22,5.0.1", BASE_IMAGE=BASE)
+            environment.pop("OCP_BASE", None)
+            result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", prepare_command["run"]],
+                                    capture_output=True, text=True, env=environment, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout + result.stderr, "")
+            outputs = dict(line.split("=", 1) for line in target.read_text().splitlines())
+            self.assertEqual(json.loads(outputs["matrix"]), matrix)
+            self.assertEqual(outputs["plan_artifact"], "ocp-ee-release-plan-12345-1")
+            self.assertEqual(set(outputs), {"matrix", "plan_artifact"})
+            self.assertNotIn(BASE, target.read_text())
+            plan = parent / "ocp-ee-release-plan.json"
+            self.assertEqual(json.loads(plan.read_text()), {"base": BASE, "matrix": matrix})
+            download_directory = parent / "ocp-ee-release-plan"
+            download_directory.mkdir()
+            shutil.copy2(plan, download_directory / plan.name)
+            for version in ("4.22.22", "5.0.1"):
+                with self.subTest(release=version):
+                    arguments = parent / "recorded-build.json"
+                    environment.update(GITHUB_RUN_ATTEMPT="2", OCP_RELEASE=version,
+                        OCP_PLAN=str(download_directory / plan.name), SOURCE_COMMIT=COMMIT,
+                        BUILD_ID="12345-2", RECORDED_ARGS=str(arguments))
+                    result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", command],
+                                            capture_output=True, text=True, env=environment, timeout=10)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout + result.stderr, "")
+                    self.assertEqual(json.loads(arguments.read_text()), ["--release", version, "--base", BASE,
+                        "--commit", COMMIT, "--run-id", "12345-2", "--output", f"{directory}/ocp-ee-{version}"])
+                    self.assertEqual(outputs["plan_artifact"], "ocp-ee-release-plan-12345-1")
+
+    def test_manual_plan_scripts_reject_invalid_inputs_without_exposing_synthetic_secrets(self):
+        workflow = yaml.load((ROOT / ".github/workflows/build-versioned-ocp-ee.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        prepare = next(step["run"] for step in workflow["jobs"]["prepare"]["steps"] if step.get("id") == "prepare")
+        command = next(step["run"] for step in workflow["jobs"]["build"]["steps"]
+                       if step["name"] == "Build and verify selected release")
+        scripts = [script.split("python3 - <<'PY'\n", 1)[1].split("\nPY", 1)[0] for script in (prepare, command)]
+        secret = "synthetic-release-plan-credential:/+$"
+        encoded = base64.b64encode(secret.encode()).decode()
+        matrix = {"include": [{"release": "4.22.22", "stream": "4.22"}]}
+        invalid = [(secret, matrix), ("quay.io/s4v0/dcm-base-ee:latest", matrix), (BASE, {}),
+                   (BASE, {"include": []}), (BASE, {"include": [{"release": secret, "stream": encoded}]}),
+                   (BASE, {"include": [{"release": "4.22.22", "stream": encoded}]}),
+                   (BASE, {"include": secret}), (BASE, {"include": [secret]}), (BASE, secret)]
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            environment = dict(os.environ, RUNNER_TEMP=directory, OCP_RELEASE="4.22.22",
+                               OCP_PLAN=str(parent / "plan.json"), GITHUB_OUTPUT=str(parent / "github-output"),
+                               GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="1")
+            environment.pop("OCP_BASE", None)
+            for index, (base, value) in enumerate(invalid):
+                (parent / "ocp-ee-release-base.txt").write_text(base)
+                (parent / "ocp-ee-release-matrix.json").write_text(json.dumps(value))
+                (parent / "plan.json").write_text(json.dumps({"base": base, "matrix": value}))
+                for stage, script in zip(("preparation", "plan"), scripts):
+                    with self.subTest(case=index, stage=stage):
+                        result = subprocess.run([sys.executable, "-"], input=script, text=True,
+                                                capture_output=True, env=environment, timeout=10)
+                        self.assertEqual(result.returncode, 1)
+                        self.assertEqual(result.stdout, "")
+                        self.assertEqual(result.stderr,
+                            f"Invalid release {stage}; original content suppressed.\n")
+                        self.assertNotIn(secret, result.stderr)
+                        self.assertNotIn(encoded, result.stderr)
+                        self.assertFalse((parent / "ocp-ee-release-plan.json").exists())
+                        self.assertFalse((parent / "github-output").exists())
 
     def test_legacy_push_cannot_publish_versioned_streams(self):
         for filename in ("pr-ee-build.yml", "push-ee-build.yml"):

@@ -24,7 +24,7 @@ jobs:
     environment: deploy
     outputs:
       matrix: ${{ steps.prepare.outputs.matrix }}
-      base: ${{ steps.prepare.outputs.base }}
+      plan_artifact: ${{ steps.prepare.outputs.plan_artifact }}
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -35,11 +35,10 @@ jobs:
         run: python3 .github/scripts/ocp_ee.py matrix --versions "$VERSIONS"
 
       - name: Log in to Quay
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Resolve one base digest and prepare matrix
         id: prepare
@@ -47,10 +46,43 @@ jobs:
           VERSIONS: ${{ inputs.versions }}
           BASE_IMAGE: ${{ inputs.base_image }}
         run: |
-          MATRIX=$(python3 .github/scripts/ocp_ee.py matrix --versions "$VERSIONS")
-          BASE=$(python3 .github/scripts/ocp_ee.py resolve-base --reference "$BASE_IMAGE")
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          python3 .github/scripts/ocp_ee.py matrix --versions "$VERSIONS" > "$RUNNER_TEMP/ocp-ee-release-matrix.json"
+          python3 .github/scripts/ocp_ee.py resolve-base --reference "$BASE_IMAGE" > "$RUNNER_TEMP/ocp-ee-release-base.txt"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          try:
+              parent = Path(os.environ["RUNNER_TEMP"])
+              matrix = json.loads((parent / "ocp-ee-release-matrix.json").read_text())
+              base = (parent / "ocp-ee-release-base.txt").read_text().strip()
+              if (not re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee@sha256:[a-f0-9]{64}", base)
+                      or not isinstance(matrix, dict) or set(matrix) != {"include"}
+                      or not isinstance(matrix["include"], list) or not 1 <= len(matrix["include"]) <= 16):
+                  raise ValueError
+              for entry in matrix["include"]:
+                  release = entry["release"]
+                  if (not isinstance(release, str)
+                          or not re.fullmatch(r"[1-9][0-9]*\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", release)
+                          or entry != {"release": release, "stream": release.rsplit(".", 1)[0]}):
+                      raise ValueError
+          except (ValueError, KeyError, TypeError, OSError):
+              raise SystemExit("Invalid release preparation; original content suppressed.") from None
+          (parent / "ocp-ee-release-plan.json").write_text(json.dumps({"matrix": matrix, "base": base}) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps(matrix) + "\n")
+              output.write("plan_artifact=ocp-ee-release-plan-" + os.environ["GITHUB_RUN_ID"]
+                           + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "\n")
+          PY
+
+      - name: Preserve release plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocp-ee-release-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ocp-ee-release-plan.json
+          retention-days: 30
+          if-no-files-found: error
 
   build:
     needs: prepare
@@ -67,30 +99,55 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Download prepared release plan
+        uses: actions/download-artifact@v4
+        with:
+          # Preparation's name also supports rerunning only failed build jobs.
+          name: ${{ needs.prepare.outputs.plan_artifact }}
+          path: ${{ runner.temp }}/ocp-ee-release-plan
+
       - name: Install pinned Ansible Builder
         run: pip install -r requirements.txt
 
       - name: Log in to Quay
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Log in to Red Hat registry
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_USERNAME }}
-          password: ${{ secrets.REDHAT_PASSWORD }}
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+        run: python3 .github/scripts/ocp_ee.py registry-login --registry registry.redhat.io
 
       - name: Build and verify selected release
         env:
           OCP_RELEASE: ${{ matrix.release }}
-          OCP_BASE: ${{ needs.prepare.outputs.base }}
+          OCP_PLAN: ${{ runner.temp }}/ocp-ee-release-plan/ocp-ee-release-plan.json
           SOURCE_COMMIT: ${{ github.sha }}
           BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
+          # Read locally: credential masking can suppress public base job outputs.
+          OCP_BASE=$(python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          try:
+              plan = json.loads(Path(os.environ["OCP_PLAN"]).read_text())
+              base = plan["base"]
+              release = os.environ["OCP_RELEASE"]
+              expected = {"release": release, "stream": release.rsplit(".", 1)[0]}
+              if (not isinstance(base, str)
+                      or not re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/dcm-base-ee@sha256:[a-f0-9]{64}", base)
+                      or expected not in plan["matrix"]["include"]):
+                  raise ValueError
+          except (ValueError, KeyError, TypeError, OSError):
+              raise SystemExit("Invalid release plan; original content suppressed.") from None
+          print(base)
+          PY
+          )
           python3 .github/scripts/ocp_ee.py build \
             --release "$OCP_RELEASE" --base "$OCP_BASE" \
             --commit "$SOURCE_COMMIT" --run-id "$BUILD_ID" \
