@@ -1,0 +1,6 @@
+# Synthetic credentials, top-level allowlist.
+[allowlist]
+description = "Synthetic password fixture in tests/test_ocp_ee.py"
+regexes = [
+  '''synthetic-Pa\$\$word:/\+42''',
+]
