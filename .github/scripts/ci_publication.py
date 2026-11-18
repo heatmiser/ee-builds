@@ -36,6 +36,15 @@ class PublicError(ValueError):
     """Only fixed diagnostics from this module may reach workflow output."""
 
 
+class CapturedFailure(PublicError):
+    """Carry process status without exposing command output or exception text."""
+
+    def __init__(self, message, *, exit_code=None, outcome="scanner-error"):
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.outcome = outcome
+
+
 def require(condition, message):
     if not condition:
         raise PublicError(message)
@@ -81,9 +90,12 @@ def captured(stage, argv, private, *, cwd=None, input=None, timeout=3600):
         try:
             result = subprocess.run(argv, cwd=cwd, input=input, stdout=out, stderr=err,
                                     env=child_env(private), timeout=timeout, check=False)
-        except (OSError, subprocess.SubprocessError):
-            raise PublicError(stage + " could not complete; raw diagnostics retained privately") from None
-    require(result.returncode == 0, stage + " failed; raw diagnostics retained privately")
+        except (OSError, subprocess.SubprocessError) as error:
+            outcome = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "execution-error"
+            raise CapturedFailure(stage + " could not complete; raw diagnostics retained privately",
+                                  outcome=outcome) from None
+    if result.returncode != 0:
+        raise CapturedFailure(stage + " failed; raw diagnostics retained privately", exit_code=result.returncode)
     return private / (stage + ".stdout")
 
 
@@ -320,21 +332,82 @@ def scanner(private):
     return executable
 
 
-def scan(paths, private, executable):
-    output = captured("secret-scan", [str(executable), "filesystem", *map(str, paths), "--json", "--no-update",
-        "--no-verification", "--fail", "--fail-on-scan-errors", "--archive-max-depth=16",
-        "--archive-max-size=2GB", "--archive-timeout=120s"], private)
-    require(not output.read_bytes().strip(), "Secret scan reported findings; publication denied")
-    stderr = (private / "secret-scan.stderr").read_text()
-    for line in stderr.splitlines():
-        # Scanner progress is JSON; diagnostics indicating skipped/incomplete
-        # inspection must not be interpreted as a clean scan.
-        if line.startswith("{"):
+def scanner_status(private, failure):
+    """Reduce private scanner output to fixed categories and bounded counters."""
+    code = failure.exit_code if failure else 0
+    code = code if type(code) is int and -255 <= code <= 255 else None
+    summary = {"exit_code": code, "findings": None, "completion": "missing", "status": "incomplete"}
+    paths = [private / ("secret-scan." + suffix) for suffix in ("stdout", "stderr")]
+    if any(not p.is_file() or p.is_symlink() for p in paths):
+        summary["status"] = failure.outcome if failure else "diagnostic-error"
+        return summary
+    if any(p.stat().st_size > 16 * 1024**2 for p in paths):
+        summary["status"] = "diagnostic-limit"
+        return summary
+    count, reported, finishes = 0, 0, 0
+    malformed, incomplete = False, False
+    try:
+        for line in paths[0].read_text().splitlines():
+            if line.strip():
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError
+                count += 1
+        for line in paths[1].read_text().splitlines():
+            if not line.strip():
+                continue
             record = json.loads(line)
-            require(record.get("level") not in ("warn", "warning", "error", "fatal"),
-                    "Secret scan was incomplete; publication denied")
-        require(not re.search(r"\b(?:skipping|skipped|timeout|exceeded)\b", line, re.I),
-                "Secret scan was incomplete; publication denied")
+            if not isinstance(record, dict):
+                raise ValueError
+            level = record.get("level", "")
+            if not isinstance(level, str) or not re.fullmatch(r"(?:trace|debug|info)(?:-[0-9]+)?", level):
+                incomplete = True
+            if re.search(r"\b(?:skipping|skipped|timeout|exceeded)\b", line, re.I):
+                incomplete = True
+            if record.get("msg") == "finished scanning":
+                finishes += 1
+                counters = [record.get(key) for key in ("verified_secrets", "unverified_secrets")]
+                if not all(type(value) is int and 0 <= value <= 1000000 for value in counters):
+                    raise ValueError
+                reported = sum(counters)
+    except (ValueError, UnicodeError, RecursionError):
+        malformed = True
+    if not malformed and count <= 1000000 and reported <= 1000000:
+        summary["findings"] = max(count, reported)
+    summary["completion"] = "invalid" if malformed or finishes > 1 else "reported" if finishes == 1 else "missing"
+    if failure and failure.outcome in ("timeout", "execution-error"):
+        summary["status"] = failure.outcome
+    elif malformed:
+        summary["status"] = "invalid-output"
+    elif code not in (0, 183):
+        summary["status"] = "scanner-error"
+    elif incomplete or finishes != 1:
+        summary["status"] = "incomplete"
+    elif summary["findings"] is None:
+        summary["status"] = "diagnostic-limit"
+    elif summary["findings"]:
+        summary["status"] = "findings"
+    elif code != 0:
+        summary["status"] = "scanner-error"
+    else:
+        summary["status"] = "complete"
+    return summary
+
+
+def scan(paths, private, executable):
+    failure = None
+    try:
+        captured("secret-scan", [str(executable), "filesystem", *map(str, paths), "--json", "--no-update",
+            "--no-verification", "--fail", "--fail-on-scan-errors", "--archive-max-depth=16",
+            "--archive-max-size=2GB", "--archive-timeout=120s"], private)
+    except CapturedFailure as error:
+        failure = error
+    summary = scanner_status(private, failure)
+    code = summary["exit_code"] if summary["exit_code"] is not None else "unavailable"
+    findings = summary["findings"] if summary["findings"] is not None else "unknown"
+    print(f'Secret scan: exit_code={code}; findings={findings}; '
+          f'completion={summary["completion"]}; status={summary["status"]}', flush=True)
+    require(summary["status"] == "complete", "Secret scan did not pass; raw diagnostics were not uploaded")
 
 
 def new_private(output):
