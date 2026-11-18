@@ -91,7 +91,8 @@ class PublicationTests(unittest.TestCase):
     def captured(self, stage, argv, private, **kwargs):
         self.commands.append((stage, argv, kwargs))
         output = private / (stage + ".stdout")
-        output.write_text(COMMIT if stage == "source" else self.image_id if stage == "image-id" else "")
+        output.write_text(COMMIT if stage == "source" else getattr(self, "inspection_output", self.image_id)
+                          if stage == "image-id" else "")
         (private / (stage + ".stderr")).write_text("")
         if stage == "export":
             shutil.copytree(self.oci, Path(argv[argv.index("--output") + 1]))
@@ -117,15 +118,76 @@ class PublicationTests(unittest.TestCase):
         return record, output, runtime.call_count, l8k_check.call_count
 
     def test_all_five_build_paths_preserve_runtime_checks_and_publish_only_fixed_files(self):
-        for index, image in enumerate(CI.IMAGES):
-            with self.subTest(image=image):
-                record, output, runtime, l8k = self.build(image, self.work / str(index))
-                self.assertEqual(record["project"], image)
-                self.assertEqual(record["image_id"], self.image_id)
-                self.assertEqual(set(p.name for p in (output / "public").iterdir()), CI.PUBLIC_FILES)
-                self.assertEqual(runtime, 0 if image == "k8s-launch-kit" else 1)
-                self.assertEqual(l8k, 1 if image == "k8s-launch-kit" else 0)
-                self.assertFalse(any(stage.startswith(("push", "login")) for stage, _, _ in self.commands))
+        for form, value in enumerate((self.image_id, self.image_id.removeprefix("sha256:"))):
+            self.inspection_output = value
+            for index, image in enumerate(CI.IMAGES):
+                with self.subTest(image=image, prefixed=form == 0):
+                    record, output, runtime, l8k = self.build(image, self.work / f"{form}-{index}")
+                    self.assertEqual(record["project"], image)
+                    self.assertEqual(record["image_id"], self.image_id)
+                    self.assertEqual(json.loads((output / "public/receipt.json").read_text())["image_id"], self.image_id)
+                    export = next(argv for stage, argv, _ in reversed(self.commands) if stage == "export")
+                    self.assertEqual(export[-1], self.image_id)
+                    self.assertEqual(set(p.name for p in (output / "public").iterdir()), CI.PUBLIC_FILES)
+                    self.assertEqual(runtime, 0 if image == "k8s-launch-kit" else 1)
+                    self.assertEqual(l8k, 1 if image == "k8s-launch-kit" else 0)
+                    self.assertFalse(any(stage.startswith(("push", "login")) for stage, _, _ in self.commands))
+
+    def test_normalization_accepts_only_full_lowercase_sha256_ids(self):
+        for value in (self.image_id, self.image_id.removeprefix("sha256:")):
+            self.assertEqual(CI.normalize_image_id(value), self.image_id)
+        invalid = (None, 1, {}, b"a" * 64, "", "a" * 63, "a" * 65, "A" * 64,
+                   "sha512:" + "a" * 64, "sha256:sha256:" + "a" * 64, "sha256:" + "a" * 63,
+                   " " + "a" * 64, "a" * 64 + "\n", "a" * 64 + "\n" + "b" * 64, SECRET)
+        for index, value in enumerate(invalid):
+            with self.subTest(case=index), self.assertRaises(CI.PublicError) as error:
+                CI.normalize_image_id(value)
+            self.assertEqual(str(error.exception), "Invalid local image identity")
+
+    def test_invalid_inspection_output_prevents_runtime_export_and_public_artifacts(self):
+        for index, value in enumerate(("a" * 63, "A" * 64, "sha512:" + "a" * 64,
+                                      "a" * 64 + "\n" + "b" * 64, SECRET)):
+            self.inspection_output = value
+            self.commands.clear()
+            output = self.work / f"invalid-build-{index}"
+            with self.subTest(case=index), self.assertRaises(CI.PublicError):
+                self.build(output=output)
+            self.assertEqual([stage for stage, _, _ in self.commands], ["source", "build", "image-id"])
+            self.assertFalse((output / "private/checks").exists())
+            self.assertFalse((output / "public").exists())
+
+    def test_publication_normalizes_inspection_id_before_comparison_and_push(self):
+        for channel in ("devel", "production"):
+            for index, value in enumerate((self.image_id, self.image_id.removeprefix("sha256:"))):
+                self.inspection_output = value
+                _, output, _, _ = self.build(output=self.work / f"publish-{channel}-{index}", channel=channel)
+                self.commands.clear()
+                with patch.dict(os.environ, REGISTRY_USERNAME="robot", REGISTRY_PASSWORD=SECRET), \
+                        patch.object(CI, "captured", side_effect=self.captured):
+                    result = CI.publish("codex-ai-helpers", channel, output)
+                self.assertEqual(len(result["tags"]), 1 if channel == "devel" else 2)
+                pushes = [argv for stage, argv, _ in self.commands if stage.startswith("push-")]
+                self.assertTrue(all(argv[-2] == self.image_id for argv in pushes))
+                self.assertFalse((output / "private/publication/auth.json").exists())
+
+    def test_malformed_or_different_inspection_id_prevents_login_and_push(self):
+        invalid = ("sha256:" + "f" * 64, "f" * 64, "a" * 63, "sha512:" + "a" * 64,
+                   "a" * 64 + "\n" + "b" * 64, SECRET)
+        for index, value in enumerate(invalid):
+            _, output, _, _ = self.build(output=self.work / f"invalid-publish-{index}")
+            self.commands.clear()
+
+            def inspect(stage, argv, private, **kwargs):
+                path = self.captured(stage, argv, private, **kwargs)
+                if stage == "image-id":
+                    path.write_text(value)
+                return path
+
+            with self.subTest(case=index), patch.dict(os.environ, REGISTRY_USERNAME="robot", REGISTRY_PASSWORD=SECRET), \
+                    patch.object(CI, "captured", side_effect=inspect), self.assertRaises(CI.PublicError) as error:
+                CI.publish("codex-ai-helpers", "devel", output)
+            self.assertNotIn(SECRET, str(error.exception))
+            self.assertFalse(any(stage == "login" or stage.startswith("push-") for stage, _, _ in self.commands))
 
     def test_failed_scan_creates_no_public_artifact(self):
         with self.assertRaises(CI.PublicError):

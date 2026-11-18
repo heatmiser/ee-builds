@@ -397,6 +397,12 @@ def l8k_evidence(results, private):
     return record
 
 
+def normalize_image_id(value):
+    match = re.fullmatch(r"(?:sha256:)?([a-f0-9]{64})", value) if isinstance(value, str) else None
+    require(match is not None, "Invalid local image identity")
+    return "sha256:" + match[1]
+
+
 def build(project, channel, output):
     project_name(project)
     data = context(channel)
@@ -411,8 +417,8 @@ def build(project, channel, output):
     else:
         captured("build", ["podman", "build", "--tag", local, "--tag", project + ":" + head, "."],
                  private, cwd=ROOT / project)
-    image_id = captured("image-id", ["podman", "image", "inspect", "--format", "{{.Id}}", local], private).read_text().strip()
-    require(re.fullmatch(r"sha256:[a-f0-9]{64}", image_id), "Invalid built image identity")
+    image_id = normalize_image_id(captured("image-id", ["podman", "image", "inspect", "--format", "{{.Id}}", local],
+                                          private).read_text().strip())
     if project == "k8s-launch-kit":
         l8k = l8k_evidence(private / "l8k", private)
         require(set(l8k) == {"version", "sourceRevision", "buildDate", "imageID", "lockSHA256",
@@ -524,8 +530,8 @@ def publish(project, channel, output):
     namespace = data["repository"].split("/")[0].lower() if channel == "devel" else "s4v0"
     head = captured("source", ["git", "rev-parse", "HEAD"], work, cwd=ROOT).read_text().strip()
     require(head == data["commit"], "Checkout differs from inspected source")
-    image_id = captured("image-id", ["podman", "image", "inspect", "--format", "{{.Id}}", record["image_id"]],
-                        work).read_text().strip()
+    image_id = normalize_image_id(captured("image-id", ["podman", "image", "inspect", "--format", "{{.Id}}", record["image_id"]],
+                                          work).read_text().strip())
     require(image_id == record["image_id"], "Local image differs from inspected image")
     destinations, manifest_digest = [], None
     try:
