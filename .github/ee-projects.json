@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "assessment_date": "2026-11-17",
+  "activity_window_start": "2025-11-17",
+  "projects": {
+    "auto-satellite-ee": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515074",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "aws-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:05Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515115",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "base-de": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "base-de-25": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "centosstream10-ansible": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-11-10T05:33:20Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/42761744256/job/129652307531",
+      "evidence_type": "build_step_executed"
+    },
+    "controller-101-aap25-rhel8": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515255",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "controller-101-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515173",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "dcm-base-ee": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:25:39Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109480542815",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-bootstrap-ee": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-08-23T22:53:47Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/32671959171/job/97274049486",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.16": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:37Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492371",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.17": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:04Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492369",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.18": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:02Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492491",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.19": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:02Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492346",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.20": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:05Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492575",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.21": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-09-29T15:30:02Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/36590045951/job/109482492552",
+      "evidence_type": "build_step_executed"
+    },
+    "dcm-ocp-ee-4.22": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-11-16T02:40:48Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/43793567071/job/133057341910",
+      "evidence_type": "build_step_executed"
+    },
+    "first-playbook-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:04Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515136",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "lightspeed-101-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515157",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "ocp-satellite-ee-4.22": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-07-15T23:13:14Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/29457568391/job/87494970540",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "product-demos-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "rh-isam-ee": {
+      "status": "active",
+      "last_recorded_ci_activity": "2026-01-30T23:19:56Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21534070693/job/62056035230",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "rhel-90-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-23T13:32:44Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/22308290659/job/64533165047",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "servicenow-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "telemetry-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "terraform-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:02Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515096",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "vmware-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": null,
+      "evidence_url": null,
+      "evidence_type": "no_recorded_ci_build_activity"
+    },
+    "windows-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515140",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    },
+    "zta-ee": {
+      "status": "example",
+      "last_recorded_ci_activity": "2026-02-03T16:57:03Z",
+      "evidence_url": "https://github.com/heatmiser/ee-builds/actions/runs/21639457760/job/62374515185",
+      "evidence_type": "build_job_record_step_details_unavailable"
+    }
+  }
+}

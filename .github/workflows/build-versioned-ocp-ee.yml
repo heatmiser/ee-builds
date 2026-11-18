@@ -99,6 +99,11 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Validate selected EE eligibility before registry access
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+        run: python3 .github/scripts/ocp_ee.py matrix --versions "$OCP_RELEASE"
+
       - name: Download prepared release plan
         uses: actions/download-artifact@v4
         with:

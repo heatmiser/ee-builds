@@ -7,6 +7,8 @@ on:
     types: [opened, reopened, synchronize]
     paths:
       - ".github/scripts/ocp_ee.py"
+      - ".github/scripts/ee_projects.py"
+      - ".github/ee-projects.json"
       - ".github/ocp-ee-streams.json"
       - ".github/workflows/pr-ocp-ee-build.yml"
       - "dcm-ocp-ee-*/**"
@@ -36,6 +38,9 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Validate PR EE eligibility before registry access
+        run: python3 .github/scripts/ocp_ee.py check-pr
 
       - name: Log in to Quay for the published base
         env:
@@ -92,6 +97,11 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Validate selected EE eligibility before registry access
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+        run: python3 .github/scripts/ocp_ee.py matrix --versions "$OCP_RELEASE"
 
       - name: Download prepared qualification plan
         uses: actions/download-artifact@v4

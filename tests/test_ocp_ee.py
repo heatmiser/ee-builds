@@ -790,6 +790,10 @@ class BuildAndPublishTests(unittest.TestCase):
         config["streams"] = {"5.0": {"definition": definition, "automatic": False}}
         config_path = workspace / "streams.json"
         config_path.write_text(json.dumps(config))
+        catalog = json.loads((ROOT / ".github/ee-projects.json").read_text())
+        catalog["projects"] = {definition: catalog["projects"]["dcm-ocp-ee-4.22"]}
+        (workspace / ".github").mkdir()
+        (workspace / ".github/ee-projects.json").write_text(json.dumps(catalog))
         with patch.object(EE, "ROOT", workspace), patch.object(EE, "CONFIG", config_path):
             receipt = EE.build("5.0.1", BASE, COMMIT, "123-1", self.output,
                                run=Runner(version="5.0.1", client="5.0.1"), opener=Mirror(version="5.0.1"))
@@ -937,6 +941,61 @@ class BuildAndPublishTests(unittest.TestCase):
                 self.assertIn('LABEL ocp.version="$OCP_VERSION"', containerfile)
                 for name in (*EE.ARCHIVES, "SHA256SUMS"):
                     self.assertTrue((output / "context/_build/ocp-release" / name).is_file())
+
+
+class ProjectEligibilityTests(unittest.TestCase):
+    def disabled(self, *names):
+        catalog = EE.load_catalog(ROOT)
+        for name in names:
+            catalog[name]["status"] = "example"
+        return patch.object(EE, "load_catalog", return_value=catalog)
+
+    def test_automatic_matrix_filters_legacy_and_versioned_examples(self):
+        with self.disabled("dcm-ocp-ee-4.16", "dcm-ocp-ee-4.22"), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            matrix = EE.automation_matrix()["include"]
+        self.assertNotIn("4.16", [e["ocp_version"] for e in matrix])
+        self.assertNotIn("4.22", [e["ocp_version"] for e in matrix])
+        self.assertNotIn("5.0", [e["ocp_version"] for e in matrix])
+        self.assertIn("Skip example-only dependent EE", stderr.getvalue())
+
+    def test_shared_definition_blocks_both_streams_and_pr_preparation(self):
+        runner = Runner()
+        with self.disabled("dcm-ocp-ee-4.22"):
+            for version in ("4.22.22", "5.0.1"):
+                with self.subTest(version=version), self.assertRaisesRegex(ValueError, "example-only"):
+                    EE.release_matrix(version)
+            with self.assertRaisesRegex(ValueError, "example-only"):
+                EE.prepare_pr(runner)
+        self.assertEqual(runner.commands, [])
+
+    def test_disabled_direct_build_fails_before_mirror_commands_or_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for selection in ("4.22.22", "stable-4.22"):
+                runner, mirror = Runner(), Mirror()
+                output = Path(directory) / selection
+                with self.disabled("dcm-ocp-ee-4.22"), self.assertRaisesRegex(ValueError, "example-only"):
+                    EE.build(selection, BASE, COMMIT, "123-1", output, run=runner, opener=mirror)
+                self.assertEqual(runner.commands, [])
+                self.assertEqual(mirror.urls, [])
+                self.assertFalse(output.exists())
+
+    def test_disabling_project_prevents_publication_of_a_retained_verified_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = EE.build("4.22.22", BASE, COMMIT, "123-1", Path(directory) / "build",
+                               run=Runner(), opener=Mirror())
+            original = receipt.read_bytes()
+            runner = Runner()
+            with self.disabled("dcm-ocp-ee-4.22"), self.assertRaisesRegex(ValueError, "example-only"):
+                EE.publish(receipt, "quay.io/s4v0", runner)
+            self.assertEqual(runner.commands, [])
+            self.assertEqual(receipt.read_bytes(), original)
+
+    def test_unknown_definition_cannot_enter_automatic_matrix(self):
+        catalog = EE.load_catalog(ROOT)
+        del catalog["dcm-ocp-ee-4.16"]
+        with patch.object(EE, "load_catalog", return_value=catalog), self.assertRaises(ValueError):
+            EE.automation_matrix()
 
 
 class WorkflowTests(unittest.TestCase):
@@ -1263,7 +1322,10 @@ else:
         self.assertEqual(build["needs"], "prepare")
         self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
         images = yaml.load((ROOT / ".github/workflows/pr-image-build.yml").read_text(), Loader=yaml.BaseLoader)
-        self.assertEqual(images["jobs"]["build-image"]["if"], "${{ false }}")
+        self.assertIn("outputs.length != '0'", images["jobs"]["build-image"]["if"])
+        publication = next(step for step in images["jobs"]["build-image"]["steps"]
+                           if step["name"] == "Publish inspected image after hosted qualification")
+        self.assertEqual(publication["if"], "${{ false }}")
         self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
         self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
         for step in prepare["steps"]:

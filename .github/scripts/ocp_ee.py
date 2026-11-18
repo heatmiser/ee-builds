@@ -14,8 +14,12 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import urllib.request
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ee_projects import CatalogError, is_active, load_catalog, require_active
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,11 +85,28 @@ def image_name(version):
     return f"dcm-ocp-ee-{stream}"
 
 
+def check_stream(stream, config=None, catalog=None):
+    config = configuration() if config is None else config
+    catalog = load_catalog(ROOT) if catalog is None else catalog
+    require(isinstance(stream, str) and re.fullmatch(STREAM_PATTERN, stream), "Invalid OpenShift stream")
+    require(stream in config["streams"] or stream in config["legacy_streams"], "OpenShift stream is not configured")
+    definition = config["streams"][stream]["definition"] if stream in config["streams"] else f"dcm-ocp-ee-{stream}"
+    require_active(definition, catalog=catalog)
+    return definition
+
+
 def automation_matrix():
     config = configuration()
-    entries = [{"ocp_version": stream, "versioned": False} for stream in config["legacy_streams"]]
-    entries += [{"ocp_version": stream, "versioned": True}
-                for stream, settings in config["streams"].items() if settings["automatic"]]
+    catalog = load_catalog(ROOT)
+    entries = []
+    candidates = [(stream, False, f"dcm-ocp-ee-{stream}") for stream in config["legacy_streams"]]
+    candidates += [(stream, True, settings["definition"]) for stream, settings in config["streams"].items()
+                   if settings["automatic"]]
+    for stream, versioned, definition in candidates:
+        if is_active(definition, catalog):
+            entries.append({"ocp_version": stream, "versioned": versioned})
+        else:
+            print(f"Skip example-only dependent EE: {definition}", file=sys.stderr)
     return {"include": entries}
 
 
@@ -95,6 +116,7 @@ def release_matrix(value):
             "Supply 1-16 distinct exact releases")
     for version in versions:
         stream_settings(release_stream(version))
+        check_stream(release_stream(version))
     return {"include": [{"release": version, "stream": release_stream(version)} for version in versions]}
 
 
@@ -285,7 +307,7 @@ def pinned_base(reference, run=execute):
     return candidates[0]
 
 
-def prepare_pr(run=execute):
+def pr_matrix():
     settings = configuration().get("pr_qualification")
     require(isinstance(settings, dict), "Require PR qualification settings")
     versions = settings.get("versions")
@@ -293,7 +315,12 @@ def prepare_pr(run=execute):
             "Require 1-16 exact PR qualification releases")
     for version in versions:
         release_version(version)
-    matrix = release_matrix(",".join(versions))
+    return release_matrix(",".join(versions))
+
+
+def prepare_pr(run=execute):
+    matrix = pr_matrix()
+    settings = configuration()["pr_qualification"]
     base = settings.get("base_image")
     require(isinstance(base, str), "Require a published PR base image reference")
     return {"matrix": matrix, "base": pinned_base(base, run)}
@@ -372,6 +399,9 @@ def validate_receipt(record):
 
 
 def build(selection, base, commit, run_id, output, pr="", run=execute, opener=urllib.request.urlopen):
+    # Resolve eligibility before mirror reads, source staging or container commands.
+    requested_stream = selection.removeprefix("stable-") if selection.startswith("stable-") else release_stream(selection)
+    check_stream(requested_stream)
     version = resolve_release(selection, opener)
     stream = release_stream(version)
     settings = stream_settings(stream)
@@ -422,6 +452,7 @@ def publish(receipt, registry, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+", registry), "Invalid image registry namespace")
     record = json.loads(receipt.read_text())
     validate_receipt(record)
+    check_stream(record["stream"])
     image = image_name(record["release"])
     require(bool(record["pr"]) == registry.startswith("ghcr.io/"), "PR builds publish only to GHCR; releases only to Quay")
     record["image_id"] = normalize_image_id(record["image_id"])
@@ -455,6 +486,9 @@ def main():
     matrix = commands.add_parser("matrix")
     matrix.add_argument("--versions", required=True)
     commands.add_parser("automation-matrix")
+    commands.add_parser("check-pr")
+    stream_check = commands.add_parser("check-stream")
+    stream_check.add_argument("--stream", required=True)
     commands.add_parser("prepare-pr")
     login = commands.add_parser("registry-login")
     login.add_argument("--registry", required=True, choices=LOGIN_REGISTRIES)
@@ -474,6 +508,11 @@ def main():
             print(json.dumps(release_matrix(args.versions)))
         elif args.command == "automation-matrix":
             print(json.dumps(automation_matrix()))
+        elif args.command == "check-pr":
+            print(json.dumps(pr_matrix()))
+        elif args.command == "check-stream":
+            check_stream(args.stream)
+            print("OpenShift EE project is active")
         elif args.command == "prepare-pr":
             print(json.dumps(prepare_pr()))
         elif args.command == "registry-login":
@@ -499,7 +538,7 @@ def main():
                     stream.write(summary)
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         # Do not echo captured command output: inherited build steps may contain credentials.
-        detail = str(error) if isinstance(error, PublicError) else type(error).__name__
+        detail = str(error) if isinstance(error, (PublicError, CatalogError)) else type(error).__name__
         parser.exit(1, f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n")
 
 

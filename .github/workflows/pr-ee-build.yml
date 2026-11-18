@@ -7,6 +7,9 @@ on:
     types: [opened, reopened, synchronize]
     paths:
       - '**/execution-environment.yml'
+      - '.github/ee-projects.json'
+      - '.github/scripts/ee_projects.py'
+      - '.github/workflows/generate_matrix.py'
       - '**/requirements.txt'
       - '**/requirements.yml'
       - '**/bindep.txt'
@@ -24,6 +27,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       length: ${{ steps.set-matrix.outputs.length }}
       ocp_matrix: ${{ steps.ocp-matrix.outputs.matrix }}
+      ocp_length: ${{ steps.ocp-matrix.outputs.length }}
     steps:
     - name: Checkout repo
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
@@ -47,6 +51,8 @@ jobs:
       run: |
         MATRIX=$(python3 .github/scripts/ocp_ee.py automation-matrix)
         echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+        MATRIX_LENGTH=$(printf '%s' "$MATRIX" | jq '.include | length')
+        echo "length=$MATRIX_LENGTH" >> "$GITHUB_OUTPUT"
 
     - name: Read matrix
       id: set-matrix
@@ -72,6 +78,11 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate EE project eligibility
+        env:
+          EE_PROJECT: ${{ matrix.ee }}
+        run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
       - name: Print working directory
         run: pwd
@@ -115,6 +126,11 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate EE project eligibility
+        env:
+          EE_PROJECT: ${{ matrix.ee }}
+        run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
       - name: Configure git credentials for private collections
         env:
@@ -186,6 +202,11 @@ jobs:
           path: ${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt
           retention-days: 7
 
+      - name: Validate EE publication eligibility
+        env:
+          EE_PROJECT: ${{ matrix.ee }}
+        run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
+
       - name: Push To GHCR
         id: push_to_ghcr
         uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
@@ -211,7 +232,9 @@ jobs:
     # require a PR-tagged dcm-base-ee image which only exists when dcm-base-ee
     # was built in this CI run.
     needs: [prepare-matrix, build-ee]
-    if: needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+    if: >-
+      needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+      && needs.prepare-matrix.outputs.ocp_length != '0'
     runs-on: ubuntu-latest
     environment: test
     concurrency:
@@ -227,6 +250,11 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate dependent EE eligibility
+        env:
+          OCP_STREAM: ${{ matrix.ocp_version }}
+        run: python3 .github/scripts/ocp_ee.py check-stream --stream "$OCP_STREAM"
 
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
@@ -306,6 +334,11 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Validate dependent EE publication eligibility
+        env:
+          OCP_STREAM: ${{ matrix.ocp_version }}
+        run: python3 .github/scripts/ocp_ee.py check-stream --stream "$OCP_STREAM"
+
       - name: Push To GHCR
         if: ${{ !matrix.versioned }}
         uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
@@ -338,3 +371,4 @@ jobs:
               issue_number: context.issue.number,
               body: `Build job completed. Bounded check reports are available in the [workflow run](${runUrl}).`
             });
+...

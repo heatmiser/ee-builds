@@ -103,7 +103,7 @@ def export_evidence(results, workflow_commit, stage, exit_code, lock_path=ROOT /
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('image-id', 'export'))
+    parser.add_argument('mode', choices=('image-id', 'verified-json', 'export'))
     parser.add_argument('--results', type=Path, required=True)
     parser.add_argument('--workflow-commit')
     parser.add_argument('--stage')
@@ -112,6 +112,9 @@ def main():
     try:
         if args.mode == 'image-id':
             print(verified_build(args.results, ROOT / 'build-lock.json')['imageID'])
+            return 0
+        if args.mode == 'verified-json':
+            print(json.dumps(verified_build(args.results, ROOT / 'build-lock.json'), sort_keys=True))
             return 0
         return export_evidence(args.results, args.workflow_commit, args.stage, args.exit_code)
     except (ValueError, KeyError, TypeError, OSError):
