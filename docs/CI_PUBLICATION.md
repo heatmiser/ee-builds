@@ -211,7 +211,13 @@ secret ARG/ENV/Git-rewrite instructions, and adds secret mounts only to actual
 Galaxy role/collection install RUN instructions. Automation Hub and per-repository
 Git credentials live in sibling files outside the context, mounted at
 `/run/secrets` for those RUNs. Shared tracked configuration is never populated with
-a real token. Signature options and the remaining build instructions are retained.
+a real token. Git clone URLs contain no credentials. A read-only credential helper
+supplies `x-access-token` as the username and the repository's token as the password
+from a separate temporary secret mount. HTTPS host and repository path matching
+is required; inherited helpers are cleared, interactive prompts are disabled, and
+Git's credential store/erase requests are ignored. Both `.git` and suffix-free
+repository URLs are supported. The credential gate also checks the resulting HTTP
+Basic encoding. Signature options and the remaining build instructions are retained.
 Unrecognized generated credential instructions reject the build. The resulting
 image is checked before any report/upload. Directly running a retained legacy
 definition outside the protected driver does not inherit this protection.

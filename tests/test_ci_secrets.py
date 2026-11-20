@@ -28,6 +28,24 @@ CANARY = "synthetic-guard-credential:/+$42"
 
 
 class SecretGuardTests(unittest.TestCase):
+    def test_git_basic_credentials_are_detected_and_attributed_for_every_source_alias(self):
+        encoded = base64.b64encode((guard.GIT_AUTH_USERNAME + ":" + CANARY).encode())
+        for source in guard.GIT_TOKEN_NAMES:
+            for alias in (source, "CI_SECRET_" + source):
+                environment = {alias: CANARY}
+                with self.subTest(source=alias):
+                    self.assertIn(encoded, guard.patterns(environment))
+                    self.assertEqual(set(guard.attributed_patterns(environment)), set(guard.patterns(environment)))
+                    with self.assertRaises(guard.GuardError):
+                        guard.inspect_stream(io.BytesIO(b"Authorization: Basic " + encoded), guard.patterns(environment))
+                    self.assertEqual(guard.matching_sources(io.BytesIO(encoded), environment), (source,))
+        environment = {"RHVP_OCP_LANDING_ZONE_TOKEN": CANARY,
+                       "CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN": CANARY + "-override",
+                       "CI_SECRET_OCP_SATELLITE_TOKEN": CANARY}
+        self.assertEqual(set(guard.attributed_patterns(environment)), set(guard.patterns(environment)))
+        self.assertEqual(guard.matching_sources(io.BytesIO(encoded), environment),
+                         ("OCP_SATELLITE_TOKEN", "RHVP_OCP_LANDING_ZONE_TOKEN"))
+
     def test_every_confidential_source_and_supported_encoding_is_detected(self):
         self.assertEqual(len(guard.SECRET_NAMES), 12)
         for name in guard.SECRET_NAMES - guard.PUBLIC_IDENTIFIERS:

@@ -23,6 +23,8 @@ SECRET_NAMES = frozenset({
 # This particular value already names the public Quay image namespace. It is an
 # identifier, not an authenticator. Other usernames remain protected values.
 PUBLIC_IDENTIFIERS = frozenset({"QUAY_USERNAME"})
+GIT_AUTH_USERNAME = "x-access-token"
+GIT_TOKEN_NAMES = frozenset({"RHVP_OCP_LANDING_ZONE_TOKEN", "RHVP_BAREMETAL_OCP_TOKEN", "OCP_SATELLITE_TOKEN"})
 BASIC_AUTH_PAIRS = (("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), ("QUAY_USERNAME", "QUAY_PASSWORD"),
                     ("REDHAT_USERNAME", "REDHAT_PASSWORD"), ("REDHAT_SA_USERNAME", "REDHAT_SA_PASSWORD"))
 MATCH_SOURCE_NAMES = SECRET_NAMES | {"REGISTRY_PASSWORD", "GH_TOKEN", "OTHER_CI_SECRET"}
@@ -127,6 +129,10 @@ def patterns(environment=None):
         username, secret = value(user, env), value(password, env)
         if username and secret:
             result.add(base64.b64encode((username + ":" + secret).encode()))
+    for name in GIT_TOKEN_NAMES:
+        for alias in (name, "CI_SECRET_" + name):
+            if secret := env.get(alias):
+                result.add(base64.b64encode((GIT_AUTH_USERNAME + ":" + secret).encode()))
     # A confidential value wins even if another source uses the same value as a
     # public namespace; only the public SOURCE is excluded above.
     return tuple(sorted(result))

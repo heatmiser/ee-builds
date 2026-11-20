@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import tempfile
 import urllib.parse
@@ -49,12 +50,33 @@ def protect_containerfile(text):
                 raise guard.GuardError("Unsupported Galaxy instruction shape")
             line = ("RUN --mount=type=secret,id=galaxy_config,target=/run/secrets/ansible.cfg "
                     "--mount=type=secret,id=git_config,target=/run/secrets/gitconfig "
-                    "ANSIBLE_CONFIG=/run/secrets/ansible.cfg GIT_CONFIG_GLOBAL=/run/secrets/gitconfig " + line[4:])
+                    "--mount=type=secret,id=git_credentials,target=/run/secrets/git-credentials "
+                    "ANSIBLE_CONFIG=/run/secrets/ansible.cfg GIT_CONFIG_GLOBAL=/run/secrets/gitconfig "
+                    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false " + line[4:])
             mounts += 1
         lines.append(line)
     if not mounts and re.search(r"(?im)^FROM .+ as galaxy$", text):
         raise guard.GuardError("Generated context has no recognized Galaxy operation")
     return "\n".join(lines) + "\n"
+
+
+def write_git_credentials(config, credentials, *, mounted_path="/run/secrets/git-credentials"):
+    """Keep clone URLs clean and serve only repository-matched, read-only credentials."""
+    entries = []
+    for key, repo in GIT_REPOS.items():
+        token = guard.value(key)
+        if any(c in token for c in "\r\n\0"):
+            raise guard.GuardError("Invalid Git credential")
+        if token:
+            for suffix in ("", ".git"):
+                entries.append("https://" + guard.GIT_AUTH_USERNAME + ":" + urllib.parse.quote(token, safe="")
+                               + "@github.com/heatmiser/" + repo + suffix + "\n")
+    # A read-only wrapper ignores Git's store/erase operations. Clearing inherited
+    # helpers prevents fallback to a credential cache or writes to image storage.
+    helper = ('!f() { if test "$1" = get; then git credential-store --file '
+              + shlex.quote(mounted_path) + ' get; fi; }; f')
+    config.write_text('[credential]\n\tuseHttpPath = true\n\thelper =\n\thelper = ' + json.dumps(helper) + '\n')
+    credentials.write_text("".join(entries))
 
 
 def build(project, tag, commit):
@@ -84,6 +106,10 @@ def build(project, tag, commit):
             # as ARG/ENV. Podman mounts them for each Galaxy RUN only.
             stage = "credential-configuration"
             config = work / "galaxy.cfg"
+            git = work / "git.cfg"
+            credentials = work / "git-credentials"
+            for path in (config, git, credentials):
+                path.touch(mode=0o600, exist_ok=False)
             token = guard.value("AH_TOKEN")
             if "\n" in token or "\r" in token:
                 raise guard.GuardError("Invalid Automation Hub credential")
@@ -96,16 +122,11 @@ def build(project, tag, commit):
                 settings["galaxy"]["server_list"] = "release_galaxy"
             with config.open("w") as stream:
                 settings.write(stream)
-            git = work / "git.cfg"
-            git.write_text("".join(
-                '[url ' + json.dumps('https://' + urllib.parse.quote(guard.value(key), safe='') + '@github.com/heatmiser/' + repo) + ']\n'
-                '\tinsteadOf = https://github.com/heatmiser/' + repo + '\n'
-                for key, repo in GIT_REPOS.items() if guard.value(key)))
-            for path in (config, git):
-                path.chmod(0o600)
+            write_git_credentials(git, credentials)
             stage = "podman-build"
             guard.captured(["podman", "build", "--secret", f"id=galaxy_config,src={config}",
-                            "--secret", f"id=git_config,src={git}", "--tag", f"{project}:{tag}",
+                            "--secret", f"id=git_config,src={git}",
+                            "--secret", f"id=git_credentials,src={credentials}", "--tag", f"{project}:{tag}",
                             "--tag", f"{project}:{commit}", str(context)], cwd=context, capture_result=False)
             stage = "image-inspection"
             guard.inspect_image(f"{project}:{tag}")
