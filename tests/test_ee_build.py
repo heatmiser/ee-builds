@@ -1,5 +1,7 @@
 """Exercise generated credential mounts and the actual protected build driver."""
 
+import contextlib
+import io
 import os
 from pathlib import Path
 import sys
@@ -78,6 +80,82 @@ class ProtectedEEBuildTests(unittest.TestCase):
         with patch.object(driver.guard, "captured") as run, self.assertRaises(ValueError):
             driver.build("aws-ee", "test-build", COMMIT)
         run.assert_not_called()
+
+    def test_failures_report_stage_and_category_without_changing_cleanup(self):
+        cases = (("identity", "command-unavailable"), ("builder-create", "command-failed"),
+                 ("context-protection", "protection-denied"), ("credential-configuration", "protection-denied"),
+                 ("podman-build", "authentication-rejected"), ("image-inspection", "credential-detected"))
+        for stage, category in cases:
+            with self.subTest(stage=stage):
+                workspaces = []
+
+                def run(argv, **kwargs):
+                    if argv[0] == "git":
+                        if stage == "identity":
+                            raise guard.GuardError("private diagnostic must stay private", category=category)
+                        return (COMMIT + "\n").encode()
+                    if argv[0] == "ansible-builder":
+                        context = Path(argv[argv.index("--context") + 1])
+                        workspaces.append(context.parent)
+                        if stage == "builder-create":
+                            raise guard.GuardError("private diagnostic must stay private", category=category)
+                        context.mkdir()
+                        text = GENERATED + 'RUN echo "$AH_TOKEN"\n' if stage == "context-protection" else GENERATED
+                        (context / "Containerfile").write_text(text)
+                        return b""
+                    self.assertEqual(argv[:2], ["podman", "build"])
+                    if stage == "podman-build":
+                        raise guard.GuardError("private diagnostic must stay private", category=category)
+                    return b""
+
+                token = "synthetic-stage-token\ninvalid" if stage == "credential-configuration" else "synthetic-stage-token"
+                with patch.dict(os.environ, CI_SECRET_AH_TOKEN=token), \
+                        patch.object(driver.guard, "captured", side_effect=run), \
+                        patch.object(driver.guard, "inspect_image") as image:
+                    if stage == "image-inspection":
+                        image.side_effect = guard.GuardError("private diagnostic must stay private", category=category)
+                    with self.assertRaises(driver.BuildError) as caught:
+                        driver.build("dcm-base-ee", "test-diagnostic", COMMIT)
+                    self.assertEqual(caught.exception.stage, stage)
+                    self.assertEqual(caught.exception.category, category)
+                    self.assertIsNone(caught.exception.__cause__)
+                    self.assertNotIn("private diagnostic", str(caught.exception))
+                    if stage != "image-inspection":
+                        image.assert_not_called()
+                self.assertTrue(all(not p.exists() for p in workspaces))
+
+    def test_cli_reports_only_fixed_metadata_and_never_raw_exception_values(self):
+        secret = "synthetic-cli-diagnostic:/+$42"
+        cases = (driver.BuildError("podman-build", "authentication-rejected"),
+                 driver.BuildError(secret, secret), OSError(secret),
+                 guard.GuardError(secret, category="credential-detected"))
+        for error in cases:
+            with self.subTest(error_type=type(error).__name__):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(sys, "argv", ["ee_build.py", "--project", "dcm-base-ee", "--tag", "test", "--commit", COMMIT]), \
+                        patch.dict(os.environ, CI_SECRET_AH_TOKEN=secret), \
+                        patch.object(driver, "build", side_effect=error), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        driver.main()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(secret, stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                expected_stage = error.stage if isinstance(error, driver.BuildError) else "unknown"
+                self.assertEqual(stderr.getvalue(), "ERROR: protected EE build failed; stage=" + expected_stage
+                                 + "; category=" + guard.error_category(error) + "; no public output prepared\n")
+
+    def test_cli_denies_even_fixed_diagnostics_when_they_match_a_supplied_value(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["ee_build.py", "--project", "dcm-base-ee", "--tag", "test", "--commit", COMMIT]), \
+                patch.dict(os.environ, CI_SECRET_AH_TOKEN="podman-build"), \
+                patch.object(driver, "build", side_effect=driver.BuildError("podman-build", "command-failed")), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught:
+                driver.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
 
 if __name__ == "__main__":

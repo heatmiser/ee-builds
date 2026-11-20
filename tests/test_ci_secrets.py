@@ -76,6 +76,68 @@ class SecretGuardTests(unittest.TestCase):
                         guard.captured([sys.executable, "-c", script])
             self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
 
+    def test_failed_command_categories_never_echo_diagnostic_text(self):
+        cases = (("unauthorized", "authentication-rejected"),
+                 ("Repository not found", "git-access-failed"),
+                 ("THESE PACKAGES DO NOT MATCH THE HASHES", "package-hash-mismatch"),
+                 ("No space left on device", "storage-exhausted"),
+                 ("x509: certificate signed by unknown authority", "tls-failure"),
+                 ("Temporary failure in name resolution", "network-failure"),
+                 ("manifest unknown", "image-reference-unavailable"),
+                 ("no matching manifest", "image-platform-mismatch"),
+                 ("No matching distribution found", "dependency-installation-failed"),
+                 ("unrecognized tool diagnostic with private URL", "command-failed"))
+        for text, category in cases:
+            with self.subTest(category=category):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                script = "import sys; sys.stderr.write(" + repr(text) + "); sys.exit(17)"
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(guard.GuardError) as caught:
+                        guard.captured([sys.executable, "-c", script])
+                self.assertEqual(caught.exception.category, category)
+                self.assertNotIn(text, str(caught.exception))
+                self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_credential_detection_precedes_diagnostic_classification(self):
+        for destination in ("stdout", "stderr"):
+            with self.subTest(destination=destination), patch.dict(os.environ, CI_SECRET_AH_TOKEN=CANARY):
+                script = ("import sys; sys." + destination + ".write(" + repr("unauthorized " + CANARY)
+                          + "); sys.exit(1)")
+                with patch.object(guard, "command_category") as classify:
+                    with self.assertRaises(guard.GuardError) as caught:
+                        guard.captured([sys.executable, "-c", script])
+                    classify.assert_not_called()
+                self.assertEqual(caught.exception.category, "credential-detected")
+                self.assertNotIn(CANARY, str(caught.exception))
+
+    def test_classifier_handles_chunk_boundaries_and_inspects_both_streams(self):
+        first = io.BytesIO(b"ordinary failure")
+        second = io.BytesIO(b"x" * (1024 * 1024 - 4) + b"UNAUTHORIZED")
+        self.assertEqual(guard.command_category((first, second)), "authentication-rejected")
+        self.assertEqual(guard.command_category((io.BytesIO(b"unauthorized"), io.BytesIO(b"disk quota exceeded"))),
+                         "storage-exhausted")
+
+    def test_start_timeout_and_output_bound_categories_do_not_expose_exceptions(self):
+        failures = ((subprocess.TimeoutExpired([CANARY], 1, output=CANARY, stderr=CANARY), "command-timeout"),
+                    (FileNotFoundError(CANARY), "command-unavailable"),
+                    (PermissionError(CANARY), "command-start-failed"))
+        for error, category in failures:
+            with self.subTest(category=category), patch.object(guard.subprocess, "run", side_effect=error):
+                with self.assertRaises(guard.GuardError) as caught:
+                    guard.captured(["synthetic-command"])
+                self.assertEqual(caught.exception.category, category)
+                self.assertNotIn(CANARY, str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+        with self.assertRaises(guard.GuardError) as caught:
+            guard.captured([sys.executable, "-c", "import sys; sys.stdout.write('x' * (4 * 1024 * 1024 + 1))"])
+        self.assertEqual(caught.exception.category, "output-too-large")
+
+    def test_unknown_error_category_cannot_become_public_diagnostic_metadata(self):
+        self.assertEqual(guard.GuardError("fixed", category=CANARY).category, "operation-failed")
+        error = ValueError(CANARY)
+        error.category = CANARY
+        self.assertEqual(guard.error_category(error), "operation-failed")
+
     def test_authfile_is_private_and_not_written_to_source_or_default_home(self):
         with tempfile.TemporaryDirectory() as name:
             auth = Path(name) / "ee-auth-test.json"
