@@ -34,9 +34,12 @@ jobs:
     outputs:
       matrix: ${{ steps.prepare.outputs.matrix }}
       plan_artifact: ${{ steps.prepare.outputs.plan_artifact }}
-    env:
-      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-pr-ocp-ee-build-prepare.json
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-pr-ocp-ee-build-prepare.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -124,9 +127,12 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-    env:
-      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-pr-ocp-ee-build-build.json
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-pr-ocp-ee-build-build.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:

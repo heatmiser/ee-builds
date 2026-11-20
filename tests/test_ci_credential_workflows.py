@@ -25,6 +25,59 @@ def workflow(name):
 
 
 class CredentialContainmentWorkflowTests(unittest.TestCase):
+    def test_runner_context_is_absent_from_workflow_and_job_env(self):
+        # GitHub resolves these mappings before assigning a runner. runner.temp
+        # is allowed in step fields, but rejects the entire workflow here.
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            data = workflow(path.name)
+            scopes = [("workflow", data.get("env", {}))]
+            scopes += [(name, job.get("env", {})) for name, job in data["jobs"].items()]
+            for name, env in scopes:
+                with self.subTest(workflow=path.name, scope=name):
+                    for value in env.values():
+                        expressions = re.findall(r"\$\{\{(.*?)\}\}", value, re.DOTALL)
+                        for expression in expressions:
+                            self.assertNotRegex(expression, r"\brunner\s*\.")
+
+    def test_all_authfile_paths_initialize_on_runner_before_checkout(self):
+        expected = {
+            "pr-ee-build.yml": {"build-ee", "build-ocp-ees"},
+            "push-ee-build.yml": {"build-ee", "build-ocp-ees"},
+            "pr-image-build.yml": {"build-image"},
+            "push-image-build.yml": {"build-image"},
+            "pr-ocp-ee-build.yml": {"prepare", "build"},
+            "build-versioned-ocp-ee.yml": {"prepare", "build"},
+        }
+        initialized = 0
+        for name, job_ids in expected.items():
+            jobs = workflow(name)["jobs"]
+            for job_id in job_ids:
+                with self.subTest(workflow=name, job=job_id), tempfile.TemporaryDirectory() as directory:
+                    job = jobs[job_id]
+                    self.assertNotIn("REGISTRY_AUTH_FILE", job.get("env", {}))
+                    first = job["steps"][0]
+                    self.assertEqual(first["name"], "Initialize job registry authentication")
+                    self.assertEqual(first["shell"], "bash")
+                    self.assertNotIn("if", first)
+                    self.assertNotIn("env", first)
+                    runner_temp = Path(directory) / "runner temp"
+                    runner_temp.mkdir()
+                    output = Path(directory) / "environment file"
+                    result = subprocess.run(["bash", "-euo", "pipefail", "-c", first["run"]],
+                                            env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(runner_temp),
+                                                 "GITHUB_ENV": str(output)}, capture_output=True, timeout=30, check=False)
+                    self.assertEqual(result.returncode, 0)
+                    filename = "ee-auth-" + name.removesuffix(".yml") + "-" + job_id + ".json"
+                    self.assertEqual(output.read_text(), "REGISTRY_AUTH_FILE=" + str(runner_temp / filename) + "\n")
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual(result.stderr, b"")
+                    self.assertFalse((runner_temp / filename).exists())
+                    cleanup = [s for s in job["steps"] if "ci_secrets.py cleanup-auth" in s.get("run", "")]
+                    self.assertEqual(len(cleanup), 1)
+                    self.assertEqual(cleanup[0]["if"], "always()")
+                    initialized += 1
+        self.assertEqual(initialized, 10)
+
     def test_every_ee_publisher_is_explicitly_held(self):
         publishers = []
         for name in EE_WORKFLOWS:
