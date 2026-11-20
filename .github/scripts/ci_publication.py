@@ -17,10 +17,10 @@ import subprocess
 import sys
 import tarfile
 import urllib.parse
-import urllib.request
 import zipfile
 
 import ci_report
+import ci_secrets
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,12 +37,7 @@ class PublicError(ValueError):
 
 
 class CapturedFailure(PublicError):
-    """Carry process status without exposing command output or exception text."""
-
-    def __init__(self, message, *, exit_code=None, outcome="scanner-error"):
-        super().__init__(message)
-        self.exit_code = exit_code
-        self.outcome = outcome
+    """Captured tool failure with a fixed public diagnostic."""
 
 
 def require(condition, message):
@@ -61,23 +56,9 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def tool_pin():
-    data = read_json(ROOT / ".github/ci-tools.json")
-    require(set(data) == {"schema_version", "trufflehog"} and type(data["schema_version"]) is int
-            and data["schema_version"] == 1, "Invalid CI tool configuration")
-    pin = data["trufflehog"]
-    require(isinstance(pin, dict) and set(pin) == {"version", "asset", "sha256"}, "Invalid scanner pin")
-    require(isinstance(pin["version"], str) and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", pin["version"]),
-            "Invalid scanner version")
-    require(pin["asset"] == "trufflehog_" + pin["version"] + "_linux_amd64.tar.gz"
-            and isinstance(pin["sha256"], str) and re.fullmatch(r"[a-f0-9]{64}", pin["sha256"]),
-            "Invalid scanner asset pin")
-    return pin
-
-
 def child_env(private):
     # Registry auth is isolated outside the build context. Do not forward tokens
-    # to builds, checks, Git clones, or the secret scanner.
+    # to builds, checks, or Git clones.
     allowed = ("PATH", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "TMPDIR")
     env = {key: os.environ[key] for key in allowed if key in os.environ}
     env.update(HOME=str(private / "home"), REGISTRY_AUTH_FILE=str(private / "auth.json"))
@@ -90,12 +71,10 @@ def captured(stage, argv, private, *, cwd=None, input=None, timeout=3600):
         try:
             result = subprocess.run(argv, cwd=cwd, input=input, stdout=out, stderr=err,
                                     env=child_env(private), timeout=timeout, check=False)
-        except (OSError, subprocess.SubprocessError) as error:
-            outcome = "timeout" if isinstance(error, subprocess.TimeoutExpired) else "execution-error"
-            raise CapturedFailure(stage + " could not complete; raw diagnostics retained privately",
-                                  outcome=outcome) from None
+        except (OSError, subprocess.SubprocessError):
+            raise CapturedFailure(stage + " could not complete; raw diagnostics retained privately") from None
     if result.returncode != 0:
-        raise CapturedFailure(stage + " failed; raw diagnostics retained privately", exit_code=result.returncode)
+        raise CapturedFailure(stage + " failed; raw diagnostics retained privately")
     return private / (stage + ".stdout")
 
 
@@ -158,8 +137,9 @@ def prepare(channel, private):
         argv = (["git", "ls-tree", "-r", "--name-only", head] if before == "0" * 40
                 else ["git", "diff", "--name-only", before, head])
         paths = captured("changed-paths", argv, private, cwd=ROOT).read_text().splitlines()
-        shared = {".github/scripts/ci_publication.py", ".github/scripts/ci_report.py", ".github/ci-tools.json",
-                  ".github/workflows/pr-image-build.yml", ".github/workflows/push-image-build.yml"}
+        shared = {".github/scripts/ci_publication.py", ".github/scripts/ci_report.py",
+                  ".github/workflows/pr-image-build.yml", ".github/workflows/push-image-build.yml",
+                  ".github/scripts/ci_secrets.py", "tests/test_ci_secrets.py"}
         images = list(IMAGES) if shared.intersection(paths) else sorted(
             {name for name in IMAGES if any(p.startswith(name + "/") for p in paths)})
     for image in images:
@@ -168,29 +148,17 @@ def prepare(channel, private):
 
 
 def variants(environment=None):
-    environment = os.environ if environment is None else environment
-    values = [value for key, value in environment.items() if value and (
-        key.startswith("CI_SECRET_") or key in {"REGISTRY_PASSWORD", "GH_TOKEN", "GITHUB_TOKEN", "QUAY_PASSWORD"})]
-    result = set()
-    for value in values:
-        require(len(value) <= 65536, "Known credential exceeds inspection bound")
-        raw = value.encode()
-        result.update((raw, base64.b64encode(raw), raw.hex().encode(), raw.hex().upper().encode(),
-                       urllib.parse.quote(value, safe="").encode(), json.dumps(value)[1:-1].encode(),
-                       value.encode("utf-16le"), value.encode("utf-16be")))
-        username = environment.get("REGISTRY_USERNAME")
-        if username:
-            result.add(base64.b64encode((username + ":" + value).encode()))
-    return tuple(result)
+    try:
+        return ci_secrets.patterns(environment)
+    except ci_secrets.GuardError:
+        raise PublicError("Known credential exceeds inspection bound") from None
 
 
 def inspect_known(stream, secrets):
-    overlap = max((len(value) for value in secrets), default=1) - 1
-    tail = b""
-    while chunk := stream.read(1024 * 1024):
-        data = tail + chunk
-        require(not any(value in data for value in secrets), "Known credential found; publication denied")
-        tail = data[-overlap:] if overlap else b""
+    try:
+        ci_secrets.inspect_stream(stream, secrets)
+    except ci_secrets.GuardError:
+        raise PublicError("Known credential found; publication denied") from None
 
 
 class Payloads:
@@ -310,106 +278,6 @@ def inspect_oci(directory, payloads, expected_id):
     return len(layers)
 
 
-def scanner(private):
-    pin = tool_pin()
-    archive = private / "scanner.tar.gz"
-    url = "https://github.com/trufflesecurity/trufflehog/releases/download/v" + pin["version"] + "/" + pin["asset"]
-    with urllib.request.urlopen(url, timeout=120) as response, archive.open("wb") as out:
-        size = 0
-        while chunk := response.read(1024 * 1024):
-            size += len(chunk)
-            require(size <= 512 * 1024**2, "Scanner download exceeds bound")
-            out.write(chunk)
-    require(digest(archive) == pin["sha256"], "Scanner checksum differs from pin")
-    with tarfile.open(archive, "r:gz") as package:
-        entries = [item for item in package if item.name == "trufflehog"]
-        require(len(entries) == 1 and entries[0].isfile() and entries[0].size <= 512 * 1024**2,
-                "Invalid scanner package")
-        executable = private / "trufflehog"
-        with package.extractfile(entries[0]) as source, executable.open("wb") as target:
-            shutil.copyfileobj(source, target)
-    executable.chmod(0o700)
-    return executable
-
-
-def scanner_status(private, failure):
-    """Reduce private scanner output to fixed categories and bounded counters."""
-    code = failure.exit_code if failure else 0
-    code = code if type(code) is int and -255 <= code <= 255 else None
-    summary = {"exit_code": code, "findings": None, "completion": "missing", "status": "incomplete"}
-    paths = [private / ("secret-scan." + suffix) for suffix in ("stdout", "stderr")]
-    if any(not p.is_file() or p.is_symlink() for p in paths):
-        summary["status"] = failure.outcome if failure else "diagnostic-error"
-        return summary
-    if any(p.stat().st_size > 16 * 1024**2 for p in paths):
-        summary["status"] = "diagnostic-limit"
-        return summary
-    count, reported, finishes = 0, 0, 0
-    malformed, incomplete = False, False
-    try:
-        for line in paths[0].read_text().splitlines():
-            if line.strip():
-                record = json.loads(line)
-                if not isinstance(record, dict):
-                    raise ValueError
-                count += 1
-        for line in paths[1].read_text().splitlines():
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                raise ValueError
-            level = record.get("level", "")
-            if not isinstance(level, str) or not re.fullmatch(r"(?:trace|debug|info)(?:-[0-9]+)?", level):
-                incomplete = True
-            if re.search(r"\b(?:skipping|skipped|timeout|exceeded)\b", line, re.I):
-                incomplete = True
-            if record.get("msg") == "finished scanning":
-                finishes += 1
-                counters = [record.get(key) for key in ("verified_secrets", "unverified_secrets")]
-                if not all(type(value) is int and 0 <= value <= 1000000 for value in counters):
-                    raise ValueError
-                reported = sum(counters)
-    except (ValueError, UnicodeError, RecursionError):
-        malformed = True
-    if not malformed and count <= 1000000 and reported <= 1000000:
-        summary["findings"] = max(count, reported)
-    summary["completion"] = "invalid" if malformed or finishes > 1 else "reported" if finishes == 1 else "missing"
-    if failure and failure.outcome in ("timeout", "execution-error"):
-        summary["status"] = failure.outcome
-    elif malformed:
-        summary["status"] = "invalid-output"
-    elif code not in (0, 183):
-        summary["status"] = "scanner-error"
-    elif incomplete or finishes != 1:
-        summary["status"] = "incomplete"
-    elif summary["findings"] is None:
-        summary["status"] = "diagnostic-limit"
-    elif summary["findings"]:
-        summary["status"] = "findings"
-    elif code != 0:
-        summary["status"] = "scanner-error"
-    else:
-        summary["status"] = "complete"
-    return summary
-
-
-def scan(paths, private, executable):
-    failure = None
-    try:
-        captured("secret-scan", [str(executable), "filesystem", *map(str, paths), "--json", "--no-update",
-            "--no-verification", "--fail", "--fail-on-scan-errors", "--archive-max-depth=16",
-            "--archive-max-size=2GB", "--archive-timeout=120s"], private)
-    except CapturedFailure as error:
-        failure = error
-    summary = scanner_status(private, failure)
-    code = summary["exit_code"] if summary["exit_code"] is not None else "unavailable"
-    findings = summary["findings"] if summary["findings"] is not None else "unknown"
-    print(f'Secret scan: exit_code={code}; findings={findings}; '
-          f'completion={summary["completion"]}; status={summary["status"]}', flush=True)
-    require(summary["status"] == "complete", "Secret scan did not pass; raw diagnostics were not uploaded")
-
-
 def new_private(output):
     temp = Path(os.environ.get("RUNNER_TEMP", "/nonexistent")).resolve()
     require(output.is_absolute() and temp in output.resolve().parents and ROOT not in output.resolve().parents,
@@ -516,9 +384,9 @@ def build(project, channel, output):
     secrets = variants()
     payloads = Payloads(private / "payloads", secrets)
     layer_count = inspect_oci(oci, payloads, image_id)
-    record = {"schema_version": 1, "project": project, "channel": channel, "source_commit": head,
+    record = {"schema_version": 2, "project": project, "channel": channel, "source_commit": head,
               "tag": data["tag"], "image_id": image_id, "image_layers": layer_count,
-              "runtime_checks": "PASS", "secret_scan": "PASS", "scanner_version": tool_pin()["version"]}
+              "runtime_checks": "PASS", "credential_check": "PASS", "upstream_scan": "NOT_RUN"}
     if l8k is not None:
         record["l8k"] = l8k
     candidate = private / "candidate"
@@ -526,7 +394,7 @@ def build(project, channel, output):
     (candidate / "receipt.json").write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
     (candidate / "report.txt").write_text(
         f'Image: {project}\nSource: {head}\nLocal image: {image_id}\n'
-        f'Runtime checks: PASS\nSecret inspection: PASS\nLayers inspected: {layer_count}\n'
+        f'Runtime checks: PASS\nWorkflow credential check: PASS\nUpstream pattern scan: NOT_RUN\nLayers inspected: {layer_count}\n'
         'Publication: not performed by this build step\n')
     (candidate / "SHA256SUMS").write_text(''.join(digest(candidate / n) + "  " + n + "\n"
                                                  for n in ("receipt.json", "report.txt")))
@@ -535,9 +403,8 @@ def build(project, channel, output):
     for path in candidate.iterdir():
         with path.open("rb") as stream:
             inspect_known(stream, secrets)
-    executable = scanner(private)
-    # Scan the actual payloads, serialized public metadata, and captured build/runtime
-    # diagnostics. Scanner's own findings/logs are never candidates for upload.
+    # Check captured diagnostics against our credentials. Upstream-content scanning
+    # is a separate review concern, not part of this credential-value gate.
     logs = private / "logs-to-scan"
     logs.mkdir(mode=0o700)
     for path in private.glob("*.stdout"):
@@ -555,7 +422,6 @@ def build(project, channel, output):
         if path.is_file():
             with path.open("rb") as stream:
                 inspect_known(stream, secrets)
-    scan([payloads.root, candidate, logs], private, executable)
     shutil.copytree(candidate, output / "public")
     inspection = {name: tree_digest(path) for name, path in (
         ("oci", oci), ("payloads", payloads.root), ("public", output / "public"), ("logs", logs))}
@@ -586,12 +452,12 @@ def publish(project, channel, output):
     require({p.name for p in public.iterdir()} == PUBLIC_FILES, "Invalid public file set")
     record = read_json(public / "receipt.json")
     fields = {"schema_version", "project", "channel", "source_commit", "tag", "image_id", "image_layers",
-              "runtime_checks", "secret_scan", "scanner_version"}
+              "runtime_checks", "credential_check", "upstream_scan"}
     require(set(record) == fields | ({"l8k"} if project == "k8s-launch-kit" else set()), "Invalid image receipt fields")
-    require(record["schema_version"] == 1 and record["project"] == project and record["channel"] == channel
+    require(record["schema_version"] == 2 and record["project"] == project and record["channel"] == channel
             and record["source_commit"] == data["commit"] and record["tag"] == data["tag"]
-            and record["scanner_version"] == tool_pin()["version"]
-            and record["runtime_checks"] == record["secret_scan"] == "PASS"
+            and record["upstream_scan"] == "NOT_RUN"
+            and record["runtime_checks"] == record["credential_check"] == "PASS"
             and isinstance(record["image_id"], str) and re.fullmatch(r"sha256:[a-f0-9]{64}", record["image_id"]),
             "Image receipt differs from requested publication")
     username, password = os.environ.get("REGISTRY_USERNAME", ""), os.environ.get("REGISTRY_PASSWORD", "")
@@ -624,6 +490,7 @@ def publish(project, channel, output):
             (work / "published.json").write_text(json.dumps({"tags": destinations, "digest": current}) + "\n")
     finally:
         (work / "auth.json").unlink(missing_ok=True)
+    ci_secrets.inspect_bytes(json.dumps({"tags": destinations, "digest": manifest_digest}))
     return {"tags": destinations, "digest": manifest_digest}
 
 

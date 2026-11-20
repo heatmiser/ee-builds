@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ee_projects import CatalogError, is_active, load_catalog, require_active
+import ci_secrets
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -195,19 +196,27 @@ def execute(argv, cwd=None):
         log_name = "builder.log" if argv[0] == "ansible-builder" else "build.log"
         with (Path(cwd).parent / log_name).open("w") as log:
             subprocess.run(argv, cwd=cwd, check=True, text=True, stdout=log,
-                           stderr=subprocess.STDOUT, timeout=3600)
+                           stderr=subprocess.STDOUT, timeout=3600, env=ci_secrets.child_env())
+        ci_secrets.inspect_paths([Path(cwd).parent / log_name])
         return ""
-    return subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True, timeout=3600).stdout
+    result = subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True, timeout=3600,
+                            env=ci_secrets.child_env())
+    ci_secrets.inspect_bytes(result.stdout or "")
+    ci_secrets.inspect_bytes(result.stderr or "")
+    return result.stdout
 
 
 def registry_login(registry):
     """Authenticate without putting passwords in argv or publishing tool output."""
     require(registry in LOGIN_REGISTRIES, "Unsupported registry login target")
-    environment = dict(os.environ)
-    username = environment.pop("REGISTRY_USERNAME", "")
-    password = environment.pop("REGISTRY_PASSWORD", "")
+    environment = ci_secrets.child_env()
+    username = os.environ.get("REGISTRY_USERNAME", "")
+    password = os.environ.get("REGISTRY_PASSWORD", "")
     require(bool(username) and bool(password), "Registry login credentials missing")
     try:
+        if os.environ.get("REGISTRY_AUTH_FILE"):
+            ci_secrets.login(registry)
+            return
         subprocess.run(["podman", "login", "--username", username, "--password-stdin", registry],
                        input=password + "\n", text=True, capture_output=True, check=True,
                        timeout=120, env=environment)
@@ -339,7 +348,9 @@ def verify_tools(version, installer, client):
 
 def write_receipt(path, record):
     validate_receipt(record)
-    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    content = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    ci_secrets.inspect_bytes(content)
+    path.write_text(content)
 
 
 def normalize_image_id(value):
@@ -444,6 +455,8 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
               "commit": commit, "run_id": run_id, "base_image": base_digest,
               "archive_sha256": archive_hashes, "release_image": payload,
               "verified_at": datetime.now(timezone.utc).isoformat()}
+    ci_secrets.inspect_paths([source, context])
+    ci_secrets.inspect_image("sha256:" + image_id)
     write_receipt(output / "receipt.json", record)
     return output / "receipt.json"
 
@@ -462,6 +475,8 @@ def publish(receipt, registry, run=execute):
     client = checked_operation("publication client verification",
         ["podman", "run", "--rm", "--pull=never", record["image_id"], "oc", "version", "--client"], run)
     require(verify_tools(record["release"], installer, client) == record["release_image"], "Release payload changed")
+    ci_secrets.inspect_bytes(json.dumps(record))
+    ci_secrets.inspect_image("sha256:" + record["image_id"])
     destinations, expected_digest = [], None
     for index, tag in enumerate(record["tags"]):
         destination = f"{registry}/{image}:{tag}"
@@ -514,12 +529,16 @@ def main():
             check_stream(args.stream)
             print("OpenShift EE project is active")
         elif args.command == "prepare-pr":
-            print(json.dumps(prepare_pr()))
+            content = json.dumps(prepare_pr())
+            ci_secrets.inspect_bytes(content)
+            print(content)
         elif args.command == "registry-login":
             registry_login(args.registry)
             print(f"Registry login succeeded for {args.registry}")
         elif args.command == "resolve-base":
-            print(pinned_base(args.reference))
+            reference = pinned_base(args.reference)
+            ci_secrets.inspect_bytes(reference)
+            print(reference)
         elif args.command == "build":
             receipt = build(args.release, args.base, args.commit, args.run_id, args.output, args.pr)
             print(receipt)
@@ -532,6 +551,7 @@ def main():
                        + f"\nRelease payload: `{record['release_image']}`\n"
                        + f"\nArchive SHA256: `{json.dumps(record['archive_sha256'], sort_keys=True)}`\n"
                        + f"\nSource: `{record['commit']}`; run: `{record['run_id']}`\n")
+            ci_secrets.inspect_bytes(summary)
             print(summary)
             if os.environ.get("GITHUB_STEP_SUMMARY"):
                 with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
@@ -539,7 +559,12 @@ def main():
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         # Do not echo captured command output: inherited build steps may contain credentials.
         detail = str(error) if isinstance(error, (PublicError, CatalogError)) else type(error).__name__
-        parser.exit(1, f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n")
+        message = f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n"
+        try:
+            ci_secrets.inspect_bytes(message)
+        except ci_secrets.GuardError:
+            message = "ERROR: credential protection denied operation\n"
+        parser.exit(1, message)
 
 
 if __name__ == "__main__":

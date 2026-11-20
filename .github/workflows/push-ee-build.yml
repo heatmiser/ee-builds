@@ -5,6 +5,10 @@ on:
     branches:
       - main
     paths:
+      - '.github/scripts/ci_secrets.py'
+      - 'tests/test_ci_secrets.py'
+      - '.github/scripts/ee_build.py'
+      - 'tests/test_ee_build.py'
       - '**/execution-environment.yml'
       - '.github/ee-projects.json'
       - '.github/scripts/ee_projects.py'
@@ -24,6 +28,10 @@ on:
         required: true
         default: 'dcm-bootstrap-ee'
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   prepare-matrix:
     runs-on: ubuntu-latest
@@ -36,6 +44,7 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       with:
+        persist-credentials: false
         fetch-depth: 0
 
     - name: Generate matrix (push)
@@ -86,10 +95,13 @@ jobs:
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-push-ee-build-build-ee.json
     steps:
       - name: Checkout repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
+          persist-credentials: false
           fetch-depth: 0
           ref: ${{ github.head_ref }}
 
@@ -103,18 +115,6 @@ jobs:
           git fetch origin ${{ github.base_ref }}
           git fetch origin ${{ github.head_ref }}
 
-      - name: Configure git credentials for private collections
-        env:
-          RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
-          RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
-        run: |
-          git config --global \
-            url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf \
-            "https://github.com/heatmiser/rhvp.ocp_landing_zone"
-          git config --global \
-            url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf \
-            "https://github.com/heatmiser/rhvp.baremetal_ocp"
-
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
 
@@ -124,38 +124,53 @@ jobs:
           echo "IMAGE_TAG=latest" >> $GITHUB_ENV
 
       - name: Log in to quay.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          LOGIN_REGISTRY: quay.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Log in to registry.redhat.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_USERNAME }}
-          password: ${{ secrets.REDHAT_PASSWORD }}
-
-      - name: Substitute token for automation hub
-        run: |
-          sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          LOGIN_REGISTRY: registry.redhat.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: (devel) Build image and create artifact
         run: |
           echo "Would build: ${{ env.EE }}"
 
       - name: Build image and create artifact
-        working-directory: ${{ matrix.ee }}
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
         run: |
-          ansible-builder build -v 3 \
-          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
-          --build-arg RHVP_OCP_LANDING_ZONE_TOKEN=${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }} \
-          --build-arg RHVP_BAREMETAL_OCP_TOKEN=${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }} \
-          --build-arg OCP_SATELLITE_TOKEN=${{ secrets.OCP_SATELLITE_TOKEN }} \
-          --context=../${{ env.EE }} \
-          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
-          --tag=${{ env.EE }}:${{ github.sha }}
+          python3 .github/scripts/ee_build.py \
+            --project "$EE" --tag "$IMAGE_TAG" --commit "$SOURCE_COMMIT"
 
       - name: Generate bounded build report
         env:
@@ -168,7 +183,23 @@ jobs:
             --local-image "$REPORT_LOCAL_IMAGE" --reference "$REPORT_REFERENCE" \
             --commit "$REPORT_COMMIT" --output "$REPORT_OUTPUT"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt"
+
       - name: Upload build artifact
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: commands-${{ matrix.ee }}
@@ -181,27 +212,44 @@ jobs:
         run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
       - name: Push To quay.io
-        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
-        with:
-          image: ${{ env.EE }}
-          tags: ${{ env.IMAGE_TAG }} ${{ github.sha }}
-          registry: quay.io/${{ secrets.QUAY_USERNAME }}/
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        if: ${{ false }} # Publication remains held.
+        id: push_to_quay
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          PUBLISH_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
+          PUBLISH_COMMIT: ${{ github.sha }}
+        run: |
+          for TAG in "$IMAGE_TAG" "$PUBLISH_COMMIT"; do
+            python3 .github/scripts/ci_secrets.py push \
+              --image "$EE:$IMAGE_TAG" --destination "$PUBLISH_REGISTRY/$EE:$TAG"
+          done
 
       - name: Print summary
+        if: steps.push_to_quay.outcome == 'success'
         run: |
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
           echo "> \`podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   build-ocp-ees:
     # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee:latest is available
     # on quay.io before the per-OCP EE layers pull it as their base_image.
     # Only runs when dcm-base-ee is in the generated matrix.
     needs: [prepare-matrix, build-ee]
+    # Publication is held; a newly published base is unavailable.
     if: >-
-      needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+      false && needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
       && needs.prepare-matrix.outputs.ocp_length != '0'
     runs-on: ubuntu-latest
     environment: deploy
@@ -211,10 +259,13 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.ocp_matrix) }}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-push-ee-build-build-ocp-ees.json
     steps:
       - name: Checkout repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Validate dependent EE eligibility
@@ -237,35 +288,50 @@ jobs:
             dcm-ocp-ee-${{ matrix.ocp_version }}/execution-environment.yml
 
       - name: Log in to quay.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: quay.io
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          LOGIN_REGISTRY: quay.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Log in to registry.redhat.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_USERNAME }}
-          password: ${{ secrets.REDHAT_PASSWORD }}
-
-      - name: Substitute token for automation hub
-        run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/1" ansible.cfg
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          LOGIN_REGISTRY: registry.redhat.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Build image
         if: ${{ !matrix.versioned }}
-        working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
         run: |
-          ansible-builder build -v 3 \
-          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
-          --context=../dcm-ocp-ee-${{ matrix.ocp_version }} \
-          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
-          --tag=${{ env.EE }}:${{ github.sha }}
+          python3 .github/scripts/ee_build.py \
+            --project "$EE" --tag "$IMAGE_TAG" --commit "$SOURCE_COMMIT"
 
       - name: Build and verify configured stable OpenShift release
         if: matrix.versioned
         env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_BASE: quay.io/${{ secrets.QUAY_USERNAME }}/dcm-base-ee:latest
           SOURCE_COMMIT: ${{ github.sha }}
@@ -277,16 +343,34 @@ jobs:
             --output "$RUNNER_TEMP/ocp-ee-$OCP_STREAM"
 
       - name: Publish verified OpenShift image
-        if: matrix.versioned
+        if: ${{ false }} # Held pending credential containment and qualification.
         env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
             --receipt "$RUNNER_TEMP/ocp-ee-$OCP_STREAM/receipt.json" --registry "$OCP_REGISTRY"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        if: success() && matrix.versioned
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json"
+
       - name: Preserve OpenShift build receipt
-        if: always() && matrix.versioned
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-${{ matrix.ocp_version }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -300,14 +384,20 @@ jobs:
         run: python3 .github/scripts/ocp_ee.py check-stream --stream "$OCP_STREAM"
 
       - name: Push To quay.io
-        if: ${{ !matrix.versioned }}
-        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
-        with:
-          image: ${{ env.EE }}
-          tags: ${{ env.IMAGE_TAG }} ${{ github.sha }}
-          registry: quay.io/${{ secrets.QUAY_USERNAME }}/
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+        if: ${{ false }} # Publication remains held.
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+          PUBLISH_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
+          PUBLISH_COMMIT: ${{ github.sha }}
+        run: |
+          for TAG in "$IMAGE_TAG" "$PUBLISH_COMMIT"; do
+            python3 .github/scripts/ci_secrets.py push \
+              --image "$EE:$IMAGE_TAG" --destination "$PUBLISH_REGISTRY/$EE:$TAG"
+          done
 
       - name: Print summary
         if: ${{ !matrix.versioned }}
@@ -315,4 +405,9 @@ jobs:
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
           echo "> \`podman pull quay.io/${{ secrets.QUAY_USERNAME }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
+
 ...

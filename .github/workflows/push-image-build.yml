@@ -5,12 +5,13 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/scripts/ci_secrets.py'
+      - 'tests/test_ci_secrets.py'
       - '**/Containerfile'
       - '**/image.yaml'
       - '**/*entrypoint.sh'
       - '**/README.md'
       - 'k8s-launch-kit/**'
-      - '.github/ci-tools.json'
       - '.github/scripts/ci_publication.py'
       - '.github/scripts/ci_report.py'
       - '.github/workflows/pr-image-build.yml'
@@ -62,6 +63,8 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-push-image-build-build-image.json
     steps:
       - name: Checkout selected source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -71,6 +74,8 @@ jobs:
 
       - name: Build, verify and scan image
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           IMAGE_PROJECT: ${{ matrix.image }}
           CI_SECRET_GITHUB_TOKEN: ${{ github.token }}
         run: |
@@ -78,7 +83,20 @@ jobs:
             --project "$IMAGE_PROJECT" --channel production \
             --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/receipt.json" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/report.txt" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/SHA256SUMS"
+
       - name: Upload build artifact
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: image-checks-${{ matrix.image }}
@@ -93,6 +111,9 @@ jobs:
         # Build execution is enabled. Publication remains separately held.
         if: ${{ false }}
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           IMAGE_PROJECT: ${{ matrix.image }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
@@ -100,4 +121,9 @@ jobs:
           python3 .github/scripts/ci_publication.py publish \
             --project "$IMAGE_PROJECT" --channel production \
             --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
+
 ...

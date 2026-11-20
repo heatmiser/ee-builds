@@ -4,6 +4,10 @@ name: Test OpenShift EE Version Selection
 on:
   pull_request:
     paths:
+      - ".github/scripts/ci_secrets.py"
+      - "tests/test_ci_secrets.py"
+      - ".github/scripts/ee_build.py"
+      - "tests/test_ee_build.py"
       - ".github/scripts/ocp_ee.py"
       - ".github/scripts/ee_projects.py"
       - ".github/ee-projects.json"
@@ -12,7 +16,6 @@ on:
       - "tests/test_generate_ee_matrix.py"
       - ".github/scripts/ci_report.py"
       - ".github/scripts/ci_publication.py"
-      - ".github/ci-tools.json"
       - "tests/test_ci_publication.py"
       - ".github/ocp-ee-streams.json"
       - ".github/workflows/build-versioned-ocp-ee.yml"

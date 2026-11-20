@@ -6,10 +6,15 @@ on:
       - main
     types: [opened, reopened, synchronize]
     paths:
+      - '.github/scripts/ci_secrets.py'
+      - 'tests/test_ci_secrets.py'
+      - '.github/scripts/ee_build.py'
+      - 'tests/test_ee_build.py'
       - '**/execution-environment.yml'
       - '.github/ee-projects.json'
       - '.github/scripts/ee_projects.py'
       - '.github/workflows/generate_matrix.py'
+      - '.github/workflows/pr-ee-build.yml'
       - '**/requirements.txt'
       - '**/requirements.yml'
       - '**/bindep.txt'
@@ -19,9 +24,24 @@ on:
       - '**/python-packages.txt'
       - '**/system-packages.txt'
   workflow_dispatch:
+    inputs:
+      ee_name:
+        description: 'Single EE for hosted qualification; publication remains held'
+        required: true
+        type: choice
+        default: dcm-base-ee
+        options:
+          - dcm-base-ee
+
+permissions:
+  contents: read
+  packages: read
 
 jobs:
   prepare-matrix:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest  
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -32,24 +52,39 @@ jobs:
     - name: Checkout repo
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
       with:
-        repository: ${{ github.event.pull_request.head.repo.full_name }}
+        persist-credentials: false
+        repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
         fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }} # exact commit
+        ref: ${{ github.event.pull_request.head.sha || github.sha }} # exact event commit
 
     - name: Generate matrix  
       id: generate-matrix
+      if: github.event_name == 'pull_request'
+      env:
+        BASE_BRANCH: ${{ github.base_ref }}
+        SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
       run: |
-        echo $GITHUB_BASE_REF
-        echo $GITHUB_HEAD_REF
         python -u .github/workflows/generate_matrix.py \
-        --start-ref origin/$GITHUB_BASE_REF \
-        --end-ref $GITHUB_HEAD_REF \
+        --start-ref "origin/$BASE_BRANCH" \
+        --end-ref "$SOURCE_COMMIT" \
         --output-path matrix_output.json
+
+    - name: Select one manual qualification EE
+      if: github.event_name == 'workflow_dispatch'
+      env:
+        EE_NAME: ${{ inputs.ee_name }}
+      run: |
+        test "$EE_NAME" = dcm-base-ee
+        python3 .github/scripts/ee_projects.py matrix --project "$EE_NAME" > matrix_output.json
 
     - name: Prepare dependent OpenShift stream matrix
       id: ocp-matrix
       run: |
-        MATRIX=$(python3 .github/scripts/ocp_ee.py automation-matrix)
+        if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+          MATRIX='{"include":[]}'
+        else
+          MATRIX=$(python3 .github/scripts/ocp_ee.py automation-matrix)
+        fi
         echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
         MATRIX_LENGTH=$(printf '%s' "$MATRIX" | jq '.include | length')
         echo "length=$MATRIX_LENGTH" >> "$GITHUB_OUTPUT"
@@ -63,52 +98,6 @@ jobs:
         echo $MATRIX_LENGTH
         echo "length=$MATRIX_LENGTH" >> $GITHUB_OUTPUT
 
-  debug:
-    needs: [prepare-matrix]
-    if: ${{ needs.prepare-matrix.outputs.length != '0' }}
-    runs-on: ubuntu-latest
-    environment: test
-    strategy:
-      matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
-      fail-fast: false
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Validate EE project eligibility
-        env:
-          EE_PROJECT: ${{ matrix.ee }}
-        run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
-
-      - name: Print working directory
-        run: pwd
-
-      - name: List files in the directory
-        run: ls -lah
-
-      - name: List environment variables
-        run: printenv
-
-      - name: Show git branch and commit
-        run: |
-          echo "Current Branch:"
-          git branch
-          echo "Current Commit:"
-          git rev-parse HEAD
-
-      - name: Fetch all branches
-        run: git fetch --all
-
-      - name: List all remote branches
-        run: git branch -r
-
-      - name: Show detailed git diff
-        run: git diff origin/main
-
   build-ee:
     needs: [prepare-matrix]
     if: ${{ needs.prepare-matrix.outputs.length != '0' }}
@@ -119,88 +108,132 @@ jobs:
     strategy:
       matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-pr-ee-build-build-ee.json
     steps:
       - name: Checkout repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Validate EE project eligibility
         env:
           EE_PROJECT: ${{ matrix.ee }}
         run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
-      - name: Configure git credentials for private collections
+      - name: Require authenticated base EE credential inputs
+        if: matrix.ee == 'dcm-base-ee'
         env:
-          RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
-          RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
         run: |
-          git config --global \
-            url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf \
-            "https://github.com/heatmiser/rhvp.ocp_landing_zone"
-          git config --global \
-            url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf \
-            "https://github.com/heatmiser/rhvp.baremetal_ocp"
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          import ci_secrets
+          required = ("AH_TOKEN", "REDHAT_SA_PASSWORD", "REDHAT_SA_USERNAME", "RHVP_OCP_LANDING_ZONE_TOKEN")
+          if not all(ci_secrets.value(name) for name in required):
+              sys.exit("ERROR: required build credentials unavailable")
+          PY
 
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
 
       - name: Define environment variables
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          BUILD_EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.number }}
         run: |
           echo "EE=${{ matrix.ee }}" >> $GITHUB_ENV
-          SHORT_SHA=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-7)
-          echo "IMAGE_TAG=pr-${{ github.event.number }}-$SHORT_SHA" >> $GITHUB_ENV
+          SHORT_SHA="${SOURCE_COMMIT:0:7}"
+          if [ "$BUILD_EVENT" = workflow_dispatch ]; then
+            echo "IMAGE_TAG=manual-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$SHORT_SHA" >> "$GITHUB_ENV"
+          else
+            echo "IMAGE_TAG=pr-$PR_NUMBER-$SHORT_SHA" >> "$GITHUB_ENV"
+          fi
           echo "IMAGE_REGISTRY=ghcr.io" >> $GITHUB_ENV
 
       - name: Login to ghcr
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          LOGIN_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Log in to registry.redhat.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_SA_USERNAME }}
-          password: ${{ secrets.REDHAT_SA_PASSWORD }}
-
-      - name: Substitute token for automation hub
-        run: |
-          sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/g" ansible.cfg
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          LOGIN_REGISTRY: registry.redhat.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Build image and create artifact
-        working-directory: ${{ matrix.ee }}
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
         run: |
-          ansible-builder build -v 3 \
-          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
-          --build-arg RHVP_OCP_LANDING_ZONE_TOKEN=${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }} \
-          --build-arg RHVP_BAREMETAL_OCP_TOKEN=${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }} \
-          --build-arg OCP_SATELLITE_TOKEN=${{ secrets.OCP_SATELLITE_TOKEN }} \
-          --context=../${{ env.EE }} \
-          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
-          --tag=${{ env.EE }}:${{ github.sha }}
+          python3 .github/scripts/ee_build.py \
+            --project "$EE" --tag "$IMAGE_TAG" --commit "$SOURCE_COMMIT"
 
       - name: Generate bounded build report
         env:
           REPORT_LOCAL_IMAGE: ${{ env.EE }}:${{ env.IMAGE_TAG }}
           REPORT_REFERENCE: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}
-          REPORT_COMMIT: ${{ github.event.pull_request.head.sha }}
+          REPORT_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           REPORT_OUTPUT: ${{ runner.temp }}/ci-report-${{ matrix.ee }}
         run: |
           python3 .github/scripts/ci_report.py --kind ee \
             --local-image "$REPORT_LOCAL_IMAGE" --reference "$REPORT_REFERENCE" \
             --commit "$REPORT_COMMIT" --output "$REPORT_OUTPUT"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt"
+
       - name: Upload build artifact
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: commands-${{ matrix.ee }}
           path: ${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt
           retention-days: 7
+          if-no-files-found: error
 
       - name: Validate EE publication eligibility
         env:
@@ -208,22 +241,36 @@ jobs:
         run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
       - name: Push To GHCR
+        if: ${{ false }} # Publication remains held.
         id: push_to_ghcr
-        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
-        with:
-          image: ${{ env.EE }}
-          tags: ${{ env.IMAGE_TAG }}
-          registry: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_OCP_SATELLITE_TOKEN: ${{ secrets.OCP_SATELLITE_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          CI_SECRET_RHVP_BAREMETAL_OCP_TOKEN: ${{ secrets.RHVP_BAREMETAL_OCP_TOKEN }}
+          CI_SECRET_RHVP_OCP_LANDING_ZONE_TOKEN: ${{ secrets.RHVP_OCP_LANDING_ZONE_TOKEN }}
+          PUBLISH_REGISTRY: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
+          PUBLISH_COMMIT: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/ci_secrets.py push \
+            --image "$EE:$IMAGE_TAG" --destination "$PUBLISH_REGISTRY/$EE:$IMAGE_TAG"
 
       - name: Set push success flag
-        if: success()
+        if: steps.push_to_ghcr.outcome == 'success'
         run: echo "push_success=true" >> $GITHUB_ENV
 
       - name: Print summary
+        if: steps.push_to_ghcr.outcome == 'success'
         run: |
           echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
           echo "Image pushed to repository: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
           echo "> \`podman pull ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   build-ocp-ees:
     # Builds dcm-ocp-ee-4.x EEs after build-ee so dcm-base-ee is available.
@@ -232,8 +279,9 @@ jobs:
     # require a PR-tagged dcm-base-ee image which only exists when dcm-base-ee
     # was built in this CI run.
     needs: [prepare-matrix, build-ee]
+    # Publication is held; a newly published base is unavailable.
     if: >-
-      needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
+      false && needs.build-ee.result == 'success' && contains(needs.prepare-matrix.outputs.matrix, 'dcm-base-ee')
       && needs.prepare-matrix.outputs.ocp_length != '0'
     runs-on: ubuntu-latest
     environment: test
@@ -243,10 +291,13 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.ocp_matrix) }}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-pr-ee-build-build-ocp-ees.json
     steps:
       - name: Checkout repo
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
+          persist-credentials: false
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -276,35 +327,46 @@ jobs:
             dcm-ocp-ee-${{ matrix.ocp_version }}/execution-environment.yml
 
       - name: Login to ghcr
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          LOGIN_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Log in to registry.redhat.io
-        uses: redhat-actions/podman-login@v1
-        with:
-          registry: registry.redhat.io
-          username: ${{ secrets.REDHAT_SA_USERNAME }}
-          password: ${{ secrets.REDHAT_SA_PASSWORD }}
-
-      - name: Substitute token for automation hub
-        run: sed -i "s/my_ah_token/${{ secrets.AH_TOKEN }}/g" ansible.cfg
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          REGISTRY_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          LOGIN_REGISTRY: registry.redhat.io
+        run: python3 .github/scripts/ci_secrets.py login --registry "$LOGIN_REGISTRY"
 
       - name: Build image
         if: ${{ !matrix.versioned }}
-        working-directory: dcm-ocp-ee-${{ matrix.ocp_version }}
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
         run: |
-          ansible-builder build -v 3 \
-          --build-arg AH_TOKEN=${{ secrets.AH_TOKEN }} \
-          --context=../dcm-ocp-ee-${{ matrix.ocp_version }} \
-          --tag=${{ env.EE }}:${{ env.IMAGE_TAG }} \
-          --tag=${{ env.EE }}:${{ github.sha }}
+          python3 .github/scripts/ee_build.py \
+            --project "$EE" --tag "$IMAGE_TAG" --commit "$SOURCE_COMMIT"
 
       - name: Build and verify configured stable OpenShift release
         if: matrix.versioned
         env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_BASE: ghcr.io/${{ github.repository_owner }}/dcm-base-ee:${{ env.BASE_EE_TAG }}
           SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
@@ -317,16 +379,32 @@ jobs:
             --output "$RUNNER_TEMP/ocp-ee-$OCP_STREAM"
 
       - name: Publish verified OpenShift image
-        if: matrix.versioned
+        if: ${{ false }} # Held pending credential containment and qualification.
         env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           OCP_STREAM: ${{ matrix.ocp_version }}
           OCP_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
             --receipt "$RUNNER_TEMP/ocp-ee-$OCP_STREAM/receipt.json" --registry "$OCP_REGISTRY"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        if: success() && matrix.versioned
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-${{ matrix.ocp_version }}/receipt.json"
+
       - name: Preserve OpenShift build receipt
-        if: always() && matrix.versioned
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-${{ matrix.ocp_version }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -340,18 +418,27 @@ jobs:
         run: python3 .github/scripts/ocp_ee.py check-stream --stream "$OCP_STREAM"
 
       - name: Push To GHCR
-        if: ${{ !matrix.versioned }}
-        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
-        with:
-          image: ${{ env.EE }}
-          tags: ${{ env.IMAGE_TAG }}
-          registry: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
+        if: ${{ false }} # Publication remains held.
+        env:
+          CI_SECRET_AH_TOKEN: ${{ secrets.AH_TOKEN }}
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+          PUBLISH_REGISTRY: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
+          PUBLISH_COMMIT: ${{ github.sha }}
+        run: |
+          python3 .github/scripts/ci_secrets.py push \
+            --image "$EE:$IMAGE_TAG" --destination "$PUBLISH_REGISTRY/$EE:$IMAGE_TAG"
 
       - name: Print summary
         if: ${{ !matrix.versioned }}
         run: |
           echo "## OCP EE Built" >> $GITHUB_STEP_SUMMARY
           echo "Image: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.EE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   post-comment:
     needs: build-ee

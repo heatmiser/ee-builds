@@ -1,7 +1,9 @@
+FROM docker.io/mwader/static-ffmpeg:7.1@sha256:a8090df5f5608daef387e1b2e93b98aaacb4d92153ad904e7d715c725724fca4 AS ffmpeg
+
 FROM registry.access.redhat.com/ubi10/ubi:10.2@sha256:802583cce6369422f62434fccd9bf310655c065cc9f4f60a007faf095e57afc7
 
-COPY --from=mwader/static-ffmpeg:7.1 /ffmpeg /usr/local/bin/
-COPY --from=mwader/static-ffmpeg:7.1 /ffprobe /usr/local/bin/
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/
+COPY --from=ffmpeg /ffprobe /usr/local/bin/
 
 RUN dnf install -y \
     nodejs \

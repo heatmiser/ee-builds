@@ -7,18 +7,20 @@ on:
 
   workflow_dispatch: # Allows manual runs as well
 
+permissions:
+  contents: read
+
 jobs:
   refresh-token:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Check out credential guard
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
       - name: Refresh Red Hat Token
         env:
-          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }} # Add your refresh token as a secret
-        run: |
-          echo "Refreshing token..."
-          curl "https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token" \
-            -d grant_type=refresh_token \
-            -d client_id="rhsm-api" \
-            -d refresh_token="$REFRESH_TOKEN" \
-            --fail --silent --show-error --output /dev/null
+          CI_SECRET_REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+        run: python3 .github/scripts/ci_secrets.py refresh-token

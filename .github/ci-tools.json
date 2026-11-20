@@ -1,8 +1,0 @@
-{
-  "schema_version": 1,
-  "trufflehog": {
-    "version": "3.97.8",
-    "asset": "trufflehog_3.97.8_linux_amd64.tar.gz",
-    "sha256": "8f71019bcb8c6c44242b6e34f68c3755f8f9c8496d3063b7a8b5626fb9bff220"
-  }
-}

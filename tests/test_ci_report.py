@@ -209,7 +209,7 @@ class WorkflowReportTests(unittest.TestCase):
                 self.assertNotIn('${{', report['run'])
                 self.assertIn('--reference "$REPORT_REFERENCE"', report['run'])
                 upload = next(s for s in steps if s['name'] == 'Upload build artifact')
-                self.assertNotIn('if', upload)
+                self.assertIn("steps.secret_files_0.outcome == 'success'", upload['if'])
                 self.assertEqual(upload['with']['retention-days'], '7' if name.startswith('pr-') else '30')
                 self.assertEqual(upload['with']['path'],
                                  '${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt')

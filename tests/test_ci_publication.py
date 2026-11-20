@@ -74,7 +74,6 @@ class PublicationTests(unittest.TestCase):
             (self.source / image).mkdir()
             (self.source / image / "Containerfile").write_text("FROM scratch\n")
         (self.source / ".github").mkdir()
-        shutil.copyfile(ROOT / ".github/ci-tools.json", self.source / ".github/ci-tools.json")
         self.event = self.work / "event.json"
         self.event.write_text(json.dumps({"inputs": {"image_name": "all"}}))
         self.env = dict(GITHUB_EVENT_PATH=str(self.event), GITHUB_EVENT_NAME="workflow_dispatch",
@@ -102,7 +101,7 @@ class PublicationTests(unittest.TestCase):
             Path(argv[argv.index("--digestfile") + 1]).write_text("sha256:" + "d" * 64)
         return output
 
-    def build(self, image="codex-ai-helpers", output=None, fail_scan=False, channel="devel"):
+    def build(self, image="codex-ai-helpers", output=None, channel="devel"):
         output = output or self.work / "results"
         l8k = {"imageID": self.image_id, "version": "v1.2.3", "sourceRevision": COMMIT,
                "buildDate": "2026-11-18T00:00:00Z", "lockSHA256": "b" * 64,
@@ -111,9 +110,7 @@ class PublicationTests(unittest.TestCase):
                "runtimeImage": "nvcr.io/example/runtime@sha256:" + "f" * 64}
         with patch.object(CI, "captured", side_effect=self.captured), \
                 patch.object(CI.ci_report, "generate", return_value=0) as runtime, \
-                patch.object(CI, "l8k_evidence", return_value=l8k) as l8k_check, \
-                patch.object(CI, "scanner", return_value=Path("/synthetic/scanner")), \
-                patch.object(CI, "scan", side_effect=CI.PublicError("Scan denied") if fail_scan else None):
+                patch.object(CI, "l8k_evidence", return_value=l8k) as l8k_check:
             record = CI.build(image, channel, output)
         return record, output, runtime.call_count, l8k_check.call_count
 
@@ -124,6 +121,9 @@ class PublicationTests(unittest.TestCase):
                 with self.subTest(image=image, prefixed=form == 0):
                     record, output, runtime, l8k = self.build(image, self.work / f"{form}-{index}")
                     self.assertEqual(record["project"], image)
+                    self.assertEqual(record["credential_check"], "PASS")
+                    self.assertEqual(record["upstream_scan"], "NOT_RUN")
+                    self.assertNotIn("secret_scan", record)
                     self.assertEqual(record["image_id"], self.image_id)
                     self.assertEqual(json.loads((output / "public/receipt.json").read_text())["image_id"], self.image_id)
                     export = next(argv for stage, argv, _ in reversed(self.commands) if stage == "export")
@@ -189,9 +189,9 @@ class PublicationTests(unittest.TestCase):
             self.assertNotIn(SECRET, str(error.exception))
             self.assertFalse(any(stage == "login" or stage.startswith("push-") for stage, _, _ in self.commands))
 
-    def test_failed_scan_creates_no_public_artifact(self):
-        with self.assertRaises(CI.PublicError):
-            self.build(fail_scan=True)
+    def test_failed_credential_check_creates_no_public_artifact(self):
+        with patch.dict(os.environ, CI_SECRET_AH_TOKEN="public build fixture"), self.assertRaises(CI.PublicError):
+            self.build()
         self.assertFalse((self.work / "results/public").exists())
 
     def test_real_runtime_command_construction_and_environment_for_all_four_helpers(self):
@@ -209,9 +209,7 @@ class PublicationTests(unittest.TestCase):
             with patch.dict(os.environ, CI_SECRET_GITHUB_TOKEN=SECRET, REGISTRY_PASSWORD=SECRET), \
                     patch.object(CI, "captured", side_effect=self.captured), \
                     patch.object(CI.ci_report, "ROOT", self.source), \
-                    patch.object(CI.subprocess, "run", side_effect=run), \
-                    patch.object(CI, "scanner", return_value=Path("/synthetic/scanner")), \
-                    patch.object(CI, "scan"):
+                    patch.object(CI.subprocess, "run", side_effect=run):
                 CI.build(image, "devel", output)
             prefix = ["podman", "run", "--rm", "--pull=never", "--network=none"]
             if image == "antigravity-ai-helpers":
@@ -299,26 +297,6 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn(SECRET, str(caught.exception) + stdout.getvalue() + stderr.getvalue())
         self.assertEqual((private / "build.stderr").read_text(), SECRET)
 
-    def test_scanner_findings_and_incomplete_scan_cannot_pass(self):
-        for index, (stdout, stderr) in enumerate(((b'{"Raw":"canary"}', ""),
-                (b"", '{"level":"warn","msg":"archive skipped"}\n'))):
-            private = CI.new_private(self.work / ("scan-" + str(index)))
-
-            def captured(*args, **kwargs):
-                (private / "secret-scan.stdout").write_bytes(stdout)
-                (private / "secret-scan.stderr").write_text(stderr)
-                return private / "secret-scan.stdout"
-
-            with patch.object(CI, "captured", side_effect=captured), self.assertRaises(CI.PublicError):
-                CI.scan([self.work], private, Path("/synthetic/scanner"))
-
-    def test_scanner_download_must_match_pin_before_executable_exists(self):
-        private = CI.new_private(self.work / "download")
-        with patch.object(CI.urllib.request, "urlopen", return_value=contextlib.closing(io.BytesIO(b"bad archive"))), \
-                self.assertRaisesRegex(CI.PublicError, "checksum"):
-            CI.scanner(private)
-        self.assertFalse((private / "trufflehog").exists())
-
     def test_tampered_evidence_prevents_login_and_push(self):
         _, output, _, _ = self.build()
         (output / "public/report.txt").write_text("changed after inspection")
@@ -373,133 +351,6 @@ class PublicationTests(unittest.TestCase):
         evidence = json.loads((output / "private/publication/published.json").read_text())
         self.assertEqual(evidence["tags"], ["quay.io/s4v0/codex-ai-helpers:latest"])
         self.assertFalse((output / "private/publication/auth.json").exists())
-
-
-class ScannerDiagnosticsTests(unittest.TestCase):
-    def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.private = Path(self.temporary.name)
-        (self.private / "home").mkdir()
-
-    def finished(self, findings=0, **changes):
-        return json.dumps(dict(level="info-0", msg="finished scanning", verified_secrets=0,
-                               unverified_secrets=findings, **changes)) + "\n"
-
-    def invoke(self, code, stdout=b"", stderr="", exception=None):
-        def run(argv, **kwargs):
-            self.assertEqual(argv[1], "filesystem")
-            self.assertIn("--no-verification", argv)
-            self.assertIn("--fail-on-scan-errors", argv)
-            self.assertNotIn(SECRET, json.dumps(kwargs["env"]))
-            kwargs["stdout"].write(stdout)
-            kwargs["stderr"].write(stderr.encode())
-            if exception:
-                raise exception
-            return subprocess.CompletedProcess(argv, code)
-
-        public = io.StringIO()
-        error = None
-        with patch.dict(os.environ, CI_SECRET_CANARY=SECRET, REGISTRY_PASSWORD=SECRET), \
-                patch.object(CI.subprocess, "run", side_effect=run), contextlib.redirect_stdout(public):
-            try:
-                CI.scan([self.private / "synthetic-input"], self.private, Path("/synthetic/scanner"))
-            except CI.PublicError as caught:
-                error = caught
-        text = public.getvalue()
-        self.assertNotIn(SECRET, text + (str(error) if error else ""))
-        self.assertNotIn("/synthetic", text)
-        self.assertNotIn("sensitive-detector", text)
-        self.assertRegex(text, r"\ASecret scan: exit_code=(?:-?[0-9]{1,3}|unavailable); findings=(?:[0-9]{1,7}|unknown); "
-                              r"completion=(?:reported|missing|invalid); status=[a-z-]+\n\Z")
-        self.assertEqual((self.private / "secret-scan.stdout").read_bytes(), stdout)
-        self.assertEqual((self.private / "secret-scan.stderr").read_text(), stderr)
-        if error:
-            self.assertEqual(str(error), "Secret scan did not pass; raw diagnostics were not uploaded")
-        return text, error
-
-    def test_clean_completed_scan_reports_only_bounded_status(self):
-        text, error = self.invoke(0, stderr=self.finished())
-        self.assertIsNone(error)
-        self.assertEqual(text, "Secret scan: exit_code=0; findings=0; completion=reported; status=complete\n")
-
-    def test_findings_are_counted_without_matches_paths_or_detector_names(self):
-        finding = json.dumps({"Raw": SECRET, "DetectorName": "sensitive-detector",
-                              "SourceMetadata": {"file": "/synthetic/" + SECRET}}).encode() + b"\n"
-        for code in (0, 183):
-            with self.subTest(exit_code=code):
-                text, error = self.invoke(code, finding, self.finished(1))
-                self.assertIsNotNone(error)
-                self.assertIn(f"exit_code={code}; findings=1; completion=reported; status=findings", text)
-
-    def test_scanner_error_and_signal_exit_are_distinguished_from_findings(self):
-        stderr = json.dumps({"level": "error-0", "msg": SECRET, "path": "/synthetic/" + SECRET}) + "\n"
-        for code in (1, 2, -9):
-            with self.subTest(exit_code=code):
-                text, error = self.invoke(code, stderr=stderr)
-                self.assertIsNotNone(error)
-                self.assertIn(f"exit_code={code}; findings=0; completion=missing; status=scanner-error", text)
-
-    def test_zero_exit_does_not_bypass_missing_completion_or_warnings(self):
-        cases = ("", json.dumps({"level": "warn-0", "msg": SECRET}) + "\n" + self.finished(),
-                 json.dumps({"level": "info-0", "msg": "archive skipped " + SECRET}) + "\n" + self.finished())
-        for index, stderr in enumerate(cases):
-            with self.subTest(case=index):
-                text, error = self.invoke(0, stderr=stderr)
-                self.assertIsNotNone(error)
-                self.assertIn("status=incomplete", text)
-
-    def test_malformed_output_and_counter_values_fail_without_echoing_content(self):
-        cases = ((SECRET.encode(), self.finished()), (b"[]\n", self.finished()),
-                 (b"\xff", self.finished()), (b"", SECRET),
-                 (b"", json.dumps({"level": "info-0", "msg": "finished scanning",
-                                   "verified_secrets": False, "unverified_secrets": SECRET}) + "\n"))
-        for index, (stdout, stderr) in enumerate(cases):
-            with self.subTest(case=index):
-                text, error = self.invoke(0, stdout, stderr)
-                self.assertIsNotNone(error)
-                self.assertIn("completion=invalid; status=invalid-output", text)
-
-    def test_findings_and_scan_error_cannot_be_misreported_as_a_clean_scan(self):
-        stdout = json.dumps({"Raw": SECRET}).encode() + b"\n"
-        stderr = json.dumps({"level": "error-0", "msg": SECRET}) + "\n" + self.finished(1)
-        text, error = self.invoke(183, stdout, stderr)
-        self.assertIsNotNone(error)
-        self.assertIn("findings=1; completion=reported; status=incomplete", text)
-
-    def test_timeout_and_execution_failure_report_unavailable_exit_code(self):
-        errors = ((subprocess.TimeoutExpired([SECRET], 3600), "timeout"),
-                  (OSError(SECRET), "execution-error"))
-        for exception, status in errors:
-            with self.subTest(status=status):
-                text, error = self.invoke(None, SECRET.encode(), SECRET, exception)
-                self.assertIsNotNone(error)
-                self.assertIn("exit_code=unavailable;", text)
-                self.assertIn("status=" + status, text)
-
-    def test_duplicate_completion_and_findings_exit_without_records_are_rejected(self):
-        for code, stderr, status in ((0, self.finished() * 2, "incomplete"),
-                                      (183, self.finished(), "scanner-error")):
-            with self.subTest(exit_code=code):
-                text, error = self.invoke(code, stderr=stderr)
-                self.assertIsNotNone(error)
-                self.assertIn("status=" + status, text)
-
-    def test_completion_counters_prevent_suppressed_findings_from_passing(self):
-        text, error = self.invoke(0, stderr=self.finished(2))
-        self.assertIsNotNone(error)
-        self.assertIn("findings=2; completion=reported; status=findings", text)
-
-    def test_oversized_or_missing_diagnostics_are_rejected_without_reading_raw_content(self):
-        summary = CI.scanner_status(self.private, None)
-        self.assertEqual(summary["status"], "diagnostic-error")
-        for name in ("stdout", "stderr"):
-            (self.private / ("secret-scan." + name)).write_bytes(b"")
-        with (self.private / "secret-scan.stdout").open("wb") as stream:
-            stream.truncate(16 * 1024**2 + 1)
-        summary = CI.scanner_status(self.private, None)
-        self.assertEqual(summary["status"], "diagnostic-limit")
-        self.assertIsNone(summary["findings"])
 
 
 class VerifierIsolationTests(unittest.TestCase):
@@ -639,7 +490,7 @@ class ImageSelectionTests(unittest.TestCase):
             build = next(s for s in job["steps"] if s["name"] == "Build, verify and scan image")
             self.assertIn("ci_publication.py build", build["run"])
             upload = next(s for s in job["steps"] if s["name"] == "Upload build artifact")
-            self.assertNotIn("if", upload)
+            self.assertIn("steps.secret_files_0.outcome == 'success'", upload["if"])
             paths = upload["with"]["path"].splitlines()
             self.assertEqual({p.rsplit("/", 1)[1] for p in paths}, CI.PUBLIC_FILES)
             self.assertTrue(all("/public/" in p and "*" not in p for p in paths))

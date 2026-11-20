@@ -6,12 +6,13 @@ on:
     branches: [main]
     types: [opened, reopened, synchronize]
     paths:
+      - '.github/scripts/ci_secrets.py'
+      - 'tests/test_ci_secrets.py'
       - '**/Containerfile'
       - '**/image.yaml'
       - '**/*entrypoint.sh'
       - '**/README.md'
       - 'k8s-launch-kit/**'
-      - '.github/ci-tools.json'
       - '.github/scripts/ci_publication.py'
       - '.github/scripts/ci_report.py'
       - '.github/workflows/pr-image-build.yml'
@@ -64,6 +65,8 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
       fail-fast: false
+    env:
+      REGISTRY_AUTH_FILE: ${{ runner.temp }}/ee-auth-pr-image-build-build-image.json
     steps:
       - name: Checkout selected source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -80,7 +83,18 @@ jobs:
             --project "$IMAGE_PROJECT" --channel devel \
             --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/receipt.json" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/report.txt" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/SHA256SUMS"
+
       - name: Upload build artifact
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: image-checks-${{ matrix.image }}
@@ -95,6 +109,7 @@ jobs:
         # Build execution is enabled. Publication remains separately held.
         if: ${{ false }}
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IMAGE_PROJECT: ${{ matrix.image }}
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ github.token }}
@@ -102,6 +117,10 @@ jobs:
           python3 .github/scripts/ci_publication.py publish \
             --project "$IMAGE_PROJECT" --channel devel \
             --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   post-comment:
     needs: build-image

@@ -29,6 +29,20 @@ IMAGE_ID = "c" * 64
 PAYLOAD = "quay.io/openshift-release-dev/ocp-release@sha256:" + "d" * 64
 
 
+def setUpModule():
+    global image_guard_patch, environment_patch
+    environment_patch = patch.dict(os.environ)
+    environment_patch.start()
+    os.environ.pop("REGISTRY_AUTH_FILE", None)
+    image_guard_patch = patch.object(EE.ci_secrets, "inspect_image", return_value="sha256:" + IMAGE_ID)
+    image_guard_patch.start()
+
+
+def tearDownModule():
+    image_guard_patch.stop()
+    environment_patch.stop()
+
+
 def installer(version="4.22.22"):
     return f"openshift-install {version}\nrelease image {PAYLOAD}\nrelease architecture amd64\n"
 
@@ -65,6 +79,10 @@ class Runner:
         self.commands.append(argv)
         if argv == ["git", "rev-parse", "HEAD"]:
             return COMMIT + "\n"
+        if argv[0] == "ansible-builder":
+            context = Path(argv[argv.index("--context") + 1])
+            context.mkdir(exist_ok=True)
+            (context / "Containerfile").write_text("FROM scratch\n")
         if argv[0] == "ansible-builder" or argv[:2] in (["podman", "pull"], ["podman", "build"]):
             return ""
         if "{{json .RepoDigests}}" in argv:
@@ -1041,7 +1059,8 @@ class WorkflowTests(unittest.TestCase):
         for step in logins:
             registry = step["run"].rsplit(" ", 1)[1]
             self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
-            self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+            self.assertEqual({key: step["env"][key] for key in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD")},
+                             dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
             self.assertNotIn("uses", step)
         self.assertEqual({step["run"].rsplit(" ", 1)[1] for step in logins}, set(expected))
         self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
@@ -1083,7 +1102,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([step["run"].rsplit(" ", 1)[1] for step in logins], registries)
             for registry, step in zip(registries, logins):
                 self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
-                self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+                self.assertEqual({key: step["env"][key] for key in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD")},
+                             dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
                 self.assertNotIn("uses", step)
             self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
 
@@ -1092,7 +1112,7 @@ class WorkflowTests(unittest.TestCase):
                              Loader=yaml.BaseLoader)
         prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
         prepare_command = next(step for step in prepare["steps"] if step.get("id") == "prepare")
-        self.assertEqual(prepare_command["env"], {"VERSIONS": "${{ inputs.versions }}",
+        self.assertEqual({key: prepare_command["env"][key] for key in ("VERSIONS", "BASE_IMAGE")}, {"VERSIONS": "${{ inputs.versions }}",
                                                   "BASE_IMAGE": "${{ inputs.base_image }}"})
         upload = next(step for step in prepare["steps"] if step["name"] == "Preserve release plan")
         self.assertEqual(upload["with"], {
@@ -1201,8 +1221,10 @@ else:
             workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
             steps = workflow["jobs"]["build-ocp-ees"]["steps"]
             for step in steps:
-                if step["name"] in ("Build image", "Push To GHCR", "Push To quay.io"):
+                if step["name"] == "Build image":
                     self.assertEqual(step["if"], "${{ !matrix.versioned }}")
+                elif step["name"] in ("Push To GHCR", "Push To quay.io"):
+                    self.assertEqual(step["if"], "${{ false }}")
             special = next(step for step in steps if step["name"] == "Build and verify configured stable OpenShift release")
             self.assertEqual(special["if"], "matrix.versioned")
             self.assertIn('--release "stable-$OCP_STREAM"', special["run"])
@@ -1217,7 +1239,7 @@ else:
         workflow = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
 
-    def test_pr_qualification_is_independent_and_publishes_only_to_ghcr(self):
+    def test_pr_qualification_is_independent_with_ghcr_publication_held(self):
         path = ROOT / ".github/workflows/pr-ocp-ee-build.yml"
         workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
@@ -1225,7 +1247,7 @@ else:
         self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
         self.assertNotIn("needs", prepare)
         self.assertEqual(build["needs"], "prepare")
-        self.assertEqual(build["permissions"]["packages"], "write")
+        self.assertEqual(build["permissions"]["packages"], "read")
         self.assertEqual(build["strategy"]["matrix"], "${{ fromJson(needs.prepare.outputs.matrix) }}")
         self.assertTrue(any("prepare-pr" in step.get("run", "") for step in prepare["steps"]))
         for job in (prepare, build):
@@ -1248,6 +1270,7 @@ else:
         self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.event.pull_request.head.sha }}")
         self.assertIn('--pr "$PR_NUMBER"', command["run"])
         publish = next(step for step in build["steps"] if step["name"] == "Publish verified PR image to GHCR")
+        self.assertEqual(publish["if"], "${{ false }}")
         self.assertEqual(publish["env"]["OCP_REGISTRY"], "ghcr.io/${{ github.repository_owner }}")
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
         validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
