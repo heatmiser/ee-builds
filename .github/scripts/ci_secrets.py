@@ -23,6 +23,9 @@ SECRET_NAMES = frozenset({
 # This particular value already names the public Quay image namespace. It is an
 # identifier, not an authenticator. Other usernames remain protected values.
 PUBLIC_IDENTIFIERS = frozenset({"QUAY_USERNAME"})
+BASIC_AUTH_PAIRS = (("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), ("QUAY_USERNAME", "QUAY_PASSWORD"),
+                    ("REDHAT_USERNAME", "REDHAT_PASSWORD"), ("REDHAT_SA_USERNAME", "REDHAT_SA_PASSWORD"))
+MATCH_SOURCE_NAMES = SECRET_NAMES | {"REGISTRY_PASSWORD", "GH_TOKEN", "OTHER_CI_SECRET"}
 
 # These are diagnostic hints, not proof of an underlying cause. Never expose
 # matching text, command arguments, return-code strings or exception attributes.
@@ -50,9 +53,26 @@ ERROR_CATEGORIES = frozenset({
 class GuardError(ValueError):
     """A fixed diagnostic, never a value, matching text, filename or tool error."""
 
-    def __init__(self, message, *, category="protection-denied"):
+    def __init__(self, message, *, category="protection-denied", sources=(), stream="unknown", command_status="unknown"):
         super().__init__(message)
         self.category = safe_category(category)
+        self.sources = safe_sources(sources)
+        self.stream = stream if stream in ("stdout", "stderr") else "unknown"
+        self.command_status = command_status if command_status in ("success", "failure") else "unknown"
+
+
+def safe_sources(sources):
+    if not isinstance(sources, (tuple, list, set, frozenset)):
+        return ()
+    return tuple(sorted({s for s in sources if isinstance(s, str) and s in MATCH_SOURCE_NAMES}))
+
+
+def error_metadata(error):
+    # Revalidate at the public boundary even if an exception was modified later.
+    stream, status = getattr(error, "stream", "unknown"), getattr(error, "command_status", "unknown")
+    return {"sources": safe_sources(getattr(error, "sources", ())),
+            "stream": stream if stream in ("stdout", "stderr") else "unknown",
+            "command_status": status if status in ("success", "failure") else "unknown"}
 
 
 def safe_category(category):
@@ -103,16 +123,52 @@ def patterns(environment=None):
                        quoted.encode(), re.sub(r"%[0-9A-F]{2}", lambda m: m[0].lower(), quoted).encode(),
                        json.dumps(item)[1:-1].encode(), json.dumps(item, ensure_ascii=False)[1:-1].encode(),
                        item.encode("utf-16le"), item.encode("utf-16be")))
-    for user, password in (("REGISTRY_USERNAME", "REGISTRY_PASSWORD"),
-                           ("QUAY_USERNAME", "QUAY_PASSWORD"),
-                           ("REDHAT_USERNAME", "REDHAT_PASSWORD"),
-                           ("REDHAT_SA_USERNAME", "REDHAT_SA_PASSWORD")):
+    for user, password in BASIC_AUTH_PAIRS:
         username, secret = value(user, env), value(password, env)
         if username and secret:
             result.add(base64.b64encode((username + ":" + secret).encode()))
     # A confidential value wins even if another source uses the same value as a
     # public namespace; only the public SOURCE is excluded above.
     return tuple(sorted(result))
+
+
+def attributed_patterns(environment=None):
+    """Map the existing matcher bytes to fixed source names, never raw env keys."""
+    env = os.environ if environment is None else environment
+    indexed = {}
+
+    def add(encoded, sources):
+        for pattern in encoded:
+            indexed.setdefault(pattern, set()).update(sources)
+
+    for name, item in env.items():
+        canonical = name.removeprefix("CI_SECRET_")
+        if item and (name.startswith("CI_SECRET_") or name in SECRET_NAMES
+                     or name in {"REGISTRY_PASSWORD", "GH_TOKEN"}) and canonical not in PUBLIC_IDENTIFIERS:
+            source = canonical if canonical in MATCH_SOURCE_NAMES else "OTHER_CI_SECRET"
+            add(patterns({name: item}), (source,))
+    for user, password in BASIC_AUTH_PAIRS:
+        username, secret = value(user, env), value(password, env)
+        if username and secret:
+            sources = {name for name in (user, password)
+                       if name in MATCH_SOURCE_NAMES and name not in PUBLIC_IDENTIFIERS}
+            add((base64.b64encode((username + ":" + secret).encode()),), sources)
+    return indexed
+
+
+def matching_sources(stream, environment=None):
+    """Identify all source aliases in the first rejected stream; retain no text."""
+    indexed = attributed_patterns(environment)
+    overlap = max((len(p) for p in indexed), default=1) - 1
+    matched, tail = set(), b""
+    stream.seek(0)
+    while chunk := stream.read(1024 * 1024):
+        data = tail + chunk
+        for pattern, sources in indexed.items():
+            if pattern in data:
+                matched.update(sources)
+        tail = data[-overlap:] if overlap else b""
+    return safe_sources(matched)
 
 
 def inspect_stream(stream, forbidden=None):
@@ -167,9 +223,16 @@ def captured(argv, *, cwd=None, input=None, timeout=3600, capture_result=True):
             raise GuardError("Protected command could not complete", category="command-unavailable") from None
         except (OSError, subprocess.SubprocessError):
             raise GuardError("Protected command could not complete", category="command-start-failed") from None
-        for stream in (stdout, stderr):
+        for stream_name, stream in (("stdout", stdout), ("stderr", stderr)):
             stream.seek(0)
-            inspect_stream(stream)
+            try:
+                inspect_stream(stream)
+            except GuardError as error:
+                if error.category != "credential-detected":
+                    raise
+                raise GuardError("Credential detected; public output denied", category="credential-detected",
+                                 sources=matching_sources(stream), stream=stream_name,
+                                 command_status="failure" if result.returncode else "success") from None
         if result.returncode:
             raise GuardError("Protected command failed", category=command_category((stdout, stderr)))
         if not capture_result:

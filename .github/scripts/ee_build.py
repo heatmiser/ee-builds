@@ -26,9 +26,10 @@ BUILD_STAGES = frozenset({"eligibility", "identity", "workspace", "builder-creat
 class BuildError(guard.GuardError):
     """Only fixed stage/category metadata may cross the CLI output boundary."""
 
-    def __init__(self, stage, category):
+    def __init__(self, stage, category, *, sources=(), stream="unknown", command_status="unknown"):
         self.stage = stage if isinstance(stage, str) and stage in BUILD_STAGES else "unknown"
-        super().__init__("Protected EE build failed", category=category)
+        super().__init__("Protected EE build failed", category=category, sources=sources,
+                         stream=stream, command_status=command_status)
 
 
 def protect_containerfile(text):
@@ -110,7 +111,7 @@ def build(project, tag, commit):
             guard.inspect_image(f"{project}:{tag}")
             stage = "workspace-cleanup"
     except (ValueError, KeyError, TypeError, OSError, configparser.Error) as error:
-        raise BuildError(stage, guard.error_category(error)) from None
+        raise BuildError(stage, guard.error_category(error), **guard.error_metadata(error)) from None
 
 
 def main():
@@ -124,8 +125,12 @@ def main():
         build(args.project, args.tag, args.commit)
     except (ValueError, KeyError, TypeError, OSError, configparser.Error) as error:
         stage = error.stage if isinstance(error, BuildError) and error.stage in BUILD_STAGES else "unknown"
-        message = (f"ERROR: protected EE build failed; stage={stage}; category={guard.error_category(error)}; "
-                   "no public output prepared\n")
+        message = f"ERROR: protected EE build failed; stage={stage}; category={guard.error_category(error)}"
+        if guard.error_category(error) == "credential-detected":
+            metadata = guard.error_metadata(error)
+            sources = ",".join(metadata["sources"]) or "unattributed"
+            message += f"; sources={sources}; stream={metadata['stream']}; command-status={metadata['command_status']}"
+        message += "; no public output prepared\n"
         try:
             guard.inspect_bytes(message)
         except guard.GuardError:

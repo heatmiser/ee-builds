@@ -108,7 +108,74 @@ class SecretGuardTests(unittest.TestCase):
                         guard.captured([sys.executable, "-c", script])
                     classify.assert_not_called()
                 self.assertEqual(caught.exception.category, "credential-detected")
+                self.assertEqual(caught.exception.sources, ("AH_TOKEN",))
+                self.assertEqual(caught.exception.stream, destination)
+                self.assertEqual(caught.exception.command_status, "failure")
                 self.assertNotIn(CANARY, str(caught.exception))
+
+    def test_attribution_reuses_every_existing_encoding_and_preserves_source_collisions(self):
+        for name in guard.SECRET_NAMES - guard.PUBLIC_IDENTIFIERS:
+            for alias in (name, "CI_SECRET_" + name):
+                environment = {alias: CANARY}
+                for encoded in guard.patterns(environment):
+                    with self.subTest(source=alias, encoded_length=len(encoded)):
+                        stream = io.BytesIO(b"ordinary-prefix " + encoded + b" ordinary-suffix")
+                        self.assertEqual(guard.matching_sources(stream, environment), (name,))
+        environment = {"CI_SECRET_AH_TOKEN": CANARY, "RHVP_OCP_LANDING_ZONE_TOKEN": CANARY,
+                       "CI_SECRET_QUAY_USERNAME": CANARY}
+        self.assertEqual(guard.matching_sources(io.BytesIO(CANARY.encode()), environment),
+                         ("AH_TOKEN", "RHVP_OCP_LANDING_ZONE_TOKEN"))
+        self.assertEqual(guard.matching_sources(io.BytesIO(CANARY.encode()), {"QUAY_USERNAME": CANARY}), ())
+
+    def test_basic_auth_pairs_and_legacy_sources_are_attributed_without_exposing_names_or_values(self):
+        for user, password in guard.BASIC_AUTH_PAIRS:
+            environment = {"CI_SECRET_" + user: "invented-registry-user", "CI_SECRET_" + password: CANARY}
+            # Use ordinary REGISTRY_USERNAME because its CI_SECRET alias is an
+            # additional confidential input, unlike a normal registry identifier.
+            if user == "REGISTRY_USERNAME":
+                environment = {user: "invented-registry-user", password: CANARY}
+            raw = base64.b64encode(("invented-registry-user:" + CANARY).encode())
+            sources = {n for n in (user, password) if n in guard.MATCH_SOURCE_NAMES and n not in guard.PUBLIC_IDENTIFIERS}
+            self.assertEqual(set(guard.matching_sources(io.BytesIO(raw), environment)), sources)
+        for alias, expected in (("GH_TOKEN", "GH_TOKEN"), ("REGISTRY_PASSWORD", "REGISTRY_PASSWORD"),
+                                ("CI_SECRET_" + CANARY, "OTHER_CI_SECRET")):
+            self.assertEqual(guard.matching_sources(io.BytesIO(CANARY.encode()), {alias: CANARY}), (expected,))
+
+    def test_attribution_index_has_exactly_the_original_matcher_bytes_and_spans_chunks(self):
+        environment = {"CI_SECRET_" + n: CANARY + "-" + n for n in guard.SECRET_NAMES}
+        environment.update(GH_TOKEN="invented-legacy-token", REGISTRY_USERNAME="invented-user",
+                           REGISTRY_PASSWORD=CANARY, CI_SECRET_ADDITIONAL_INPUT="invented-additional-token")
+        self.assertEqual(set(guard.attributed_patterns(environment)), set(guard.patterns(environment)))
+        stream = io.BytesIO(b"x" * (1024 * 1024 - 4) + CANARY.encode())
+        self.assertEqual(guard.matching_sources(stream, {"CI_SECRET_AH_TOKEN": CANARY}), ("AH_TOKEN",))
+
+    def test_capture_attributes_encoded_credentials_on_success_and_failure(self):
+        encoded = base64.b64encode(CANARY.encode()).decode()
+        for destination in ("stdout", "stderr"):
+            for code in (0, 19):
+                with self.subTest(stream=destination, exit_code=code), patch.dict(os.environ, CI_SECRET_AH_TOKEN=CANARY):
+                    script = "import sys; sys." + destination + ".write(" + repr(encoded) + "); sys.exit(" + str(code) + ")"
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        with self.assertRaises(guard.GuardError) as caught:
+                            guard.captured([sys.executable, "-c", script])
+                    self.assertEqual(caught.exception.category, "credential-detected")
+                    self.assertEqual(guard.error_metadata(caught.exception),
+                                     {"sources": ("AH_TOKEN",), "stream": destination,
+                                      "command_status": "failure" if code else "success"})
+                    self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+                    self.assertNotIn(CANARY, str(caught.exception))
+                    self.assertNotIn(encoded, str(caught.exception))
+
+    def test_attribution_metadata_rejects_arbitrary_text_and_is_revalidated(self):
+        error = guard.GuardError("fixed", category="credential-detected", sources=(CANARY, "AH_TOKEN"),
+                                 stream=CANARY, command_status=CANARY)
+        self.assertEqual(guard.error_metadata(error), {"sources": ("AH_TOKEN",), "stream": "unknown", "command_status": "unknown"})
+        error.sources = (CANARY, "REDHAT_SA_USERNAME")
+        error.stream, error.command_status = CANARY, CANARY
+        self.assertEqual(guard.error_metadata(error),
+                         {"sources": ("REDHAT_SA_USERNAME",), "stream": "unknown", "command_status": "unknown"})
+        self.assertEqual(guard.safe_sources(CANARY), ())
 
     def test_classifier_handles_chunk_boundaries_and_inspects_both_streams(self):
         first = io.BytesIO(b"ordinary failure")

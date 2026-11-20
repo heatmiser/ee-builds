@@ -84,7 +84,8 @@ class ProtectedEEBuildTests(unittest.TestCase):
     def test_failures_report_stage_and_category_without_changing_cleanup(self):
         cases = (("identity", "command-unavailable"), ("builder-create", "command-failed"),
                  ("context-protection", "protection-denied"), ("credential-configuration", "protection-denied"),
-                 ("podman-build", "authentication-rejected"), ("image-inspection", "credential-detected"))
+                 ("podman-build", "authentication-rejected"), ("podman-build", "credential-detected"),
+                 ("image-inspection", "credential-detected"))
         for stage, category in cases:
             with self.subTest(stage=stage):
                 workspaces = []
@@ -105,7 +106,8 @@ class ProtectedEEBuildTests(unittest.TestCase):
                         return b""
                     self.assertEqual(argv[:2], ["podman", "build"])
                     if stage == "podman-build":
-                        raise guard.GuardError("private diagnostic must stay private", category=category)
+                        raise guard.GuardError("private diagnostic must stay private", category=category,
+                                               sources=("REDHAT_SA_USERNAME",), stream="stdout", command_status="success")
                     return b""
 
                 token = "synthetic-stage-token\ninvalid" if stage == "credential-configuration" else "synthetic-stage-token"
@@ -118,6 +120,9 @@ class ProtectedEEBuildTests(unittest.TestCase):
                         driver.build("dcm-base-ee", "test-diagnostic", COMMIT)
                     self.assertEqual(caught.exception.stage, stage)
                     self.assertEqual(caught.exception.category, category)
+                    if stage == "podman-build":
+                        self.assertEqual(guard.error_metadata(caught.exception),
+                                         {"sources": ("REDHAT_SA_USERNAME",), "stream": "stdout", "command_status": "success"})
                     self.assertIsNone(caught.exception.__cause__)
                     self.assertNotIn("private diagnostic", str(caught.exception))
                     if stage != "image-inspection":
@@ -128,7 +133,9 @@ class ProtectedEEBuildTests(unittest.TestCase):
         secret = "synthetic-cli-diagnostic:/+$42"
         cases = (driver.BuildError("podman-build", "authentication-rejected"),
                  driver.BuildError(secret, secret), OSError(secret),
-                 guard.GuardError(secret, category="credential-detected"))
+                 guard.GuardError(secret, category="credential-detected"),
+                 driver.BuildError("podman-build", "credential-detected", sources=("AH_TOKEN", secret),
+                                   stream="stderr", command_status="failure"))
         for error in cases:
             with self.subTest(error_type=type(error).__name__):
                 stdout, stderr = io.StringIO(), io.StringIO()
@@ -143,8 +150,12 @@ class ProtectedEEBuildTests(unittest.TestCase):
                 self.assertNotIn(secret, stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
                 expected_stage = error.stage if isinstance(error, driver.BuildError) else "unknown"
+                metadata = guard.error_metadata(error)
+                attribution = ("; sources=" + (",".join(metadata["sources"]) or "unattributed")
+                               + "; stream=" + metadata["stream"] + "; command-status=" + metadata["command_status"]
+                               if guard.error_category(error) == "credential-detected" else "")
                 self.assertEqual(stderr.getvalue(), "ERROR: protected EE build failed; stage=" + expected_stage
-                                 + "; category=" + guard.error_category(error) + "; no public output prepared\n")
+                                 + "; category=" + guard.error_category(error) + attribution + "; no public output prepared\n")
 
     def test_cli_denies_even_fixed_diagnostics_when_they_match_a_supplied_value(self):
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -156,6 +167,27 @@ class ProtectedEEBuildTests(unittest.TestCase):
                 driver.main()
         self.assertEqual(caught.exception.code, 1)
         self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+
+    def test_cli_revalidates_attribution_and_denies_source_label_collisions(self):
+        secret = "synthetic-attribution-diagnostic:/+$42"
+        for token in (secret, "AH_TOKEN"):
+            with self.subTest(label_collision=token == "AH_TOKEN"):
+                error = driver.BuildError("podman-build", "credential-detected")
+                error.sources, error.stream, error.command_status = (secret, "AH_TOKEN"), secret, secret
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(sys, "argv", ["ee_build.py", "--project", "dcm-base-ee", "--tag", "test", "--commit", COMMIT]), \
+                        patch.dict(os.environ, CI_SECRET_AH_TOKEN=token), \
+                        patch.object(driver, "build", side_effect=error), \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        driver.main()
+                self.assertEqual(caught.exception.code, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertNotIn(secret, stderr.getvalue())
+                if token == "AH_TOKEN":
+                    self.assertEqual(stderr.getvalue(), "")
+                else:
+                    self.assertIn("sources=AH_TOKEN; stream=unknown; command-status=unknown", stderr.getvalue())
 
 
 if __name__ == "__main__":
