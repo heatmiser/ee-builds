@@ -23,7 +23,7 @@ def require(condition):
         raise ValueError('Invalid CI report input')
 
 
-def generate(kind, local_image, reference, commit, output, run=None):
+def generate(kind, local_image, reference, commit, output, run=None, *, network=None, container_env=None):
     run = run or subprocess.run
     require(kind in ('ee', 'image'))
     match = re.fullmatch(r'([a-z0-9][a-z0-9_-]{0,127}):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})', local_image)
@@ -32,6 +32,15 @@ def generate(kind, local_image, reference, commit, output, run=None):
     require(re.fullmatch(r'(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/' + re.escape(local_image), reference))
     require(re.fullmatch(r'[a-f0-9]{40}', commit))
     base = ['podman', 'run', '--rm', '--pull=never']
+    require(network in (None, 'none'))
+    require(container_env is None or isinstance(container_env, dict))
+    if network is not None:
+        base += ['--network=' + network]
+    for name, value in (container_env or {}).items():
+        require(isinstance(name, str) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name))
+        require(isinstance(value, str) and '\x00' not in value and '\n' not in value and '\r' not in value)
+    for name, value in sorted((container_env or {}).items()):
+        base += ['--env', name + '=' + value]
     if kind == 'ee':
         checks = [('ansible-collections', base + [local_image, 'ansible-galaxy', 'collection', 'list']),
                   ('ansible-version', base + [local_image, 'ansible', '--version'])]
