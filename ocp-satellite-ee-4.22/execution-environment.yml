@@ -22,6 +22,12 @@ options:
 
 additional_build_steps:
   prepend_base:
+    # Install the Python 3.9 RPM dependency before restoring the base image's
+    # Python 3.12 interpreter, so bindep cannot change it during assemble.
+    - "RUN microdnf install -y python3-cryptography && ln -sf /usr/bin/python3.12 /usr/bin/python3 && microdnf clean all"
+    # AAP 2.6 removes pip from the base image; bootstrap it for the interpreter
+    # used by Ansible without installing the Python 3.9 python3-pip RPM.
+    - RUN $PYCMD -m ensurepip --upgrade && $PYCMD -m pip install --upgrade pip setuptools
     # openshift-clients stub RPM — satisfies the kubernetes.core bindep check.
     # The real oc/kubectl/openshift-install binaries are host-level on the Arceus
     # bootc host (/usr/local/bin/); the EE does not need them for runtime tasks.
@@ -33,6 +39,11 @@ additional_build_steps:
   prepend_galaxy:
     # ansible.cfg configures galaxy_server_list: automation_hub (AH) + release_galaxy.
     - ADD _build/configs/ansible.cfg /etc/ansible/ansible.cfg
+
+  append_builder:
+    # assemble removes pip during cleanup. Restore it before the final stage
+    # copies the builder filesystem and installs dumb-init.
+    - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
     - LABEL maintainer="Mike Savage"

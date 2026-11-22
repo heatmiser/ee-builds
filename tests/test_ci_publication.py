@@ -1,14 +1,18 @@
 """Offline plain-image build contracts with synthetic OCI images and credentials."""
 
 import contextlib
+import bz2
 import gzip
 import hashlib
 import importlib.util
 import io
 import json
+import lzma
 import os
 from pathlib import Path
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -38,6 +42,40 @@ def tar_bytes(entries):
             info.size = len(value)
             archive.addfile(info, io.BytesIO(value))
     return stream.getvalue()
+
+
+def cpio_bytes(entries, *, crc=False):
+    """Synthetic newc/CRC archive, including its required trailer."""
+    output = bytearray()
+    for name, value in [*entries.items(), ("TRAILER!!!", b"")]:
+        mode = stat.S_IFREG | 0o644 if name != "TRAILER!!!" else 0
+        if isinstance(value, tuple):
+            value, mode = value
+        encoded = name.encode() + b"\0"
+        fields = [1, mode, 0, 0, 1, 0, len(value), 0, 0, 0, 0, len(encoded),
+                  sum(value) & 0xffffffff if crc else 0]
+        output.extend((b"070702" if crc else b"070701")
+                      + b"".join(f"{field:08x}".encode() for field in fields) + encoded)
+        output.extend(b"\0" * ((-len(output)) % 4))
+        output.extend(value)
+        output.extend(b"\0" * ((-len(value)) % 4))
+    return bytes(output) + b"\0" * ((-len(output)) % 512)
+
+
+def rpm_bytes(payload, *, compression="gzip", metadata=b"synthetic-metadata"):
+    """Minimal RPM section framing for inspection, never installation/signing."""
+    lead = bytearray(96)
+    lead[:6] = b"\xed\xab\xee\xdb\x03\x00"
+    lead[78:80] = b"\x00\x05"
+
+    def header(data):
+        return b"\x8e\xad\xe8\x01\0\0\0\0" + struct.pack("!II", 0, len(data)) + data
+
+    signature = header(b"signature")
+    encode = {"gzip": lambda value: gzip.compress(value, mtime=0), "xz": lzma.compress,
+              "bzip2": bz2.compress, "none": lambda value: value}
+    return (bytes(lead) + signature + b"\0" * ((-len(signature)) % 8)
+            + header(metadata) + encode[compression](payload))
 
 
 def oci_fixture(directory, layers=None, environment=None):
@@ -268,6 +306,83 @@ class PublicationTests(unittest.TestCase):
             CI.Payloads(self.work / "payloads1", ()).add(io.BytesIO(b"12345"))
         with self.assertRaisesRegex(CI.PublicError, "limit"):
             CI.Payloads(self.work / "payloads2", ()).add(io.BytesIO(b"data"), depth=9)
+
+    def test_rpm_clean_cpio_members_with_supported_compression(self):
+        for compression in ("gzip", "xz", "bzip2", "none"):
+            for crc in (False, True):
+                with self.subTest(compression=compression, crc=crc):
+                    output = self.work / f"rpm-{compression}-{crc}"
+                    data = rpm_bytes(cpio_bytes({"usr/share/example.txt": b"clean fixture"}, crc=crc),
+                                     compression=compression)
+                    CI.Payloads(output, ()).add(io.BytesIO(data))
+                    self.assertIn(b"clean fixture", [p.read_bytes() for p in output.iterdir()])
+
+    def test_rpm_headers_names_links_and_nested_contents_detect_credentials(self):
+        fixtures = [rpm_bytes(cpio_bytes({"file": b"clean"}), metadata=SECRET.encode()),
+                    rpm_bytes(cpio_bytes({SECRET: b"clean"})),
+                    rpm_bytes(cpio_bytes({"link": (SECRET.encode(), stat.S_IFLNK | 0o777)})),
+                    rpm_bytes(cpio_bytes({"nested.gz": gzip.compress(SECRET.encode())}, crc=True))]
+        for index, data in enumerate(fixtures):
+            with self.subTest(index=index), self.assertRaisesRegex(CI.PublicError, "Known credential"):
+                CI.Payloads(self.work / f"rpm-secret-{index}", (SECRET.encode(),)).add(io.BytesIO(data))
+
+    def test_rpm_credential_in_lower_layer_prevents_public_artifact(self):
+        shutil.rmtree(self.oci)
+        data = rpm_bytes(cpio_bytes({"private.txt": SECRET.encode()}))
+        self.image_id = oci_fixture(self.oci, layers=[tar_bytes({"fixture.rpm": data}),
+                                                    tar_bytes({".wh.fixture.rpm": b""})])
+        with patch.dict(os.environ, CI_SECRET_CANARY=SECRET), self.assertRaisesRegex(CI.PublicError, "Known credential"):
+            self.build()
+        self.assertFalse((self.work / "results/public").exists())
+
+    def test_rpm_malformed_headers_and_unsupported_payloads_fail_closed(self):
+        good = rpm_bytes(cpio_bytes({"file": b"clean"}))
+        wrong_header = bytearray(good)
+        wrong_header[96] = 0
+        oversized = bytearray(good)
+        oversized[104:108] = struct.pack("!I", 0xffffffff)
+        wrong_padding = bytearray(good)
+        wrong_padding[121] = 1
+        fixtures = [good[:40], bytes(wrong_header), bytes(oversized), bytes(wrong_padding),
+                    good[:-5], rpm_bytes(b"070707unsupported"),
+                    rpm_bytes(b"\x28\xb5\x2f\xfdunsupported", compression="none")]
+        for index, data in enumerate(fixtures):
+            with self.subTest(index=index), self.assertRaises(CI.PublicError):
+                CI.Payloads(self.work / f"rpm-invalid-{index}", ()).add(io.BytesIO(data))
+
+    def test_rpm_cpio_checksum_truncation_and_trailing_data_fail_closed(self):
+        payload = cpio_bytes({"file": b"clean"}, crc=True)
+        checksum = bytearray(payload)
+        checksum[102:110] = b"ffffffff"
+        nonhex = bytearray(payload)
+        nonhex[6:14] = b"invalid!"
+        for index, data in enumerate((bytes(checksum), bytes(nonhex), payload[:125], payload + b"unexpected")):
+            with self.subTest(index=index), self.assertRaises(CI.PublicError):
+                CI.Payloads(self.work / f"rpm-cpio-invalid-{index}", ()).add(io.BytesIO(rpm_bytes(data)))
+
+    def test_rpm_cpio_paths_and_member_sizes_are_checked(self):
+        for index, name in enumerate(("../escape", "/absolute", "bad\\path")):
+            with self.subTest(name=name), self.assertRaisesRegex(CI.PublicError, "Unsafe archive"):
+                CI.Payloads(self.work / f"rpm-path-{index}", ()).add(io.BytesIO(rpm_bytes(cpio_bytes({name: b"data"}))))
+        oversized = bytearray(cpio_bytes({"file": b"data"}))
+        oversized[54:62] = b"ffffffff"
+        with self.assertRaisesRegex(CI.PublicError, "bound"):
+            CI.Payloads(self.work / "rpm-member-size", ()).add(io.BytesIO(rpm_bytes(bytes(oversized))))
+        self.assertFalse((self.work / "escape").exists())
+
+    def test_rpm_expansion_count_depth_and_total_limits_are_preserved(self):
+        data = rpm_bytes(cpio_bytes({"file": b"x" * 4096}))
+        for label, attribute, limit, depth in (("file", "MAX_FILE", 1024, 0),
+                                               ("total", "MAX_TOTAL", len(data), 0),
+                                               ("count", "MAX_FILES", 1, 0),
+                                               ("depth", "MAX_FILES", CI.MAX_FILES, 8)):
+            with self.subTest(label=label), patch.object(CI, attribute, limit), self.assertRaisesRegex(CI.PublicError, "limit"):
+                CI.Payloads(self.work / f"rpm-limit-{label}", ()).add(io.BytesIO(data), depth)
+
+    def test_rpm_support_keeps_other_unsupported_archives_blocked(self):
+        for index, data in enumerate((b"7z\xbc\xaf\x27\x1cfixture", b"Rar!fixture")):
+            with self.subTest(index=index), self.assertRaisesRegex(CI.PublicError, "Unsupported nested"):
+                CI.Payloads(self.work / f"unsupported-{index}", ()).add(io.BytesIO(data))
 
     def test_secret_variants_are_detected_across_stream_boundaries(self):
         for value in CI.variants({"CI_SECRET_CANARY": SECRET, "REGISTRY_USERNAME": "robot"}):

@@ -38,6 +38,13 @@ additional_build_steps:
     - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
+    # Podman engines and clients must not be installed in this EE. Check both
+    # executable lookup and the RPM inventory; an RPM query failure also fails.
+    - >-
+      RUN $PYCMD -c 'import shutil, subprocess, sys;
+      installed = subprocess.check_output(["rpm", "-qa", "--qf", "%{NAME}\n"], text=True).splitlines();
+      forbidden = any(shutil.which(name) or name in installed for name in ("podman", "podman-remote"));
+      sys.exit("Podman is forbidden in dcm-bootstrap-ee" if forbidden else 0)'
     - LABEL maintainer="Mike Savage"
     - LABEL quay.expires-after="45d"
 ...

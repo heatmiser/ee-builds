@@ -13,6 +13,8 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -161,6 +163,23 @@ def inspect_known(stream, secrets):
         raise PublicError("Known credential found; publication denied") from None
 
 
+class MemberReader:
+    """Expose one bounded CPIO member without reading the following member."""
+
+    def __init__(self, stream, size, crc=False):
+        self.stream, self.remaining, self.crc = stream, size, crc
+        self.checksum = 0
+
+    def read(self, size=-1):
+        amount = self.remaining if size < 0 else min(size, self.remaining)
+        data = self.stream.read(amount)
+        require(len(data) == amount, "Truncated CPIO member")
+        self.remaining -= len(data)
+        if self.crc:
+            self.checksum = (self.checksum + sum(data)) & 0xffffffff
+        return data
+
+
 class Payloads:
     """Expand common archives to numeric files without following container links."""
 
@@ -199,10 +218,16 @@ class Payloads:
             opener = gzip.open if magic.startswith(b"\x1f\x8b") else lzma.open if magic.startswith(b"\xfd7zXZ") else bz2.open
             with opener(target, "rb") as content:
                 self.add(content, depth + 1)
+        elif magic.startswith(b"\xed\xab\xee\xdb"):
+            expanded = True
+            self.rpm(target, depth)
+        elif magic.startswith((b"070701", b"070702")):
+            expanded = True
+            self.cpio(target, depth)
         elif tarfile.is_tarfile(target):
             expanded = True
             self.tar(target, depth)
-        elif magic.startswith((b"7z\xbc\xaf\x27\x1c", b"Rar!", b"\xed\xab\xee\xdb")):
+        elif magic.startswith((b"7z\xbc\xaf\x27\x1c", b"Rar!")):
             raise PublicError("Unsupported nested archive; publication denied")
         if expanded:
             target.unlink()
@@ -231,6 +256,84 @@ class Payloads:
                     require(item.size <= MAX_FILE, "Archive member exceeds inspection bound")
                     with archive.extractfile(item) as stream:
                         self.add(stream, depth + 1)
+
+
+    def rpm(self, target, depth):
+        """Inspect RPM sections and a supported CPIO payload; never install it.
+
+        Layout: https://rpm.org/docs/latest/manual/format_v4.html . RPM signing
+        keys and install scriptlets are data here; this is not signature checking.
+        """
+        try:
+            with target.open("rb") as stream:
+                lead = stream.read(96)
+                require(len(lead) == 96 and lead[:6] == b"\xed\xab\xee\xdb\x03\x00"
+                        and lead[78:80] == b"\x00\x05", "Unsupported RPM lead")
+                for signature in (True, False):
+                    header = stream.read(16)
+                    require(len(header) == 16 and header[:8] == b"\x8e\xad\xe8\x01\x00\x00\x00\x00",
+                            "Invalid RPM header")
+                    entries, size = struct.unpack("!II", header[8:])
+                    end = stream.tell() + 16 * entries + size
+                    require(entries <= MAX_FILES and end <= target.stat().st_size,
+                            "RPM header exceeds inspection bound")
+                    stream.seek(end)
+                    if signature:
+                        padding = (-end) % 8
+                        require(stream.read(padding) == b"\0" * padding, "Invalid RPM header padding")
+                offset = stream.tell()
+                magic = stream.read(8)
+                stream.seek(offset)
+                if magic.startswith((b"070701", b"070702")):
+                    self.add(stream, depth + 1)
+                else:
+                    if magic.startswith(b"\x1f\x8b"):
+                        content = gzip.GzipFile(fileobj=stream)
+                    elif magic.startswith(b"\xfd7zXZ\x00"):
+                        content = lzma.LZMAFile(stream)
+                    elif magic.startswith(b"BZh"):
+                        content = bz2.BZ2File(stream)
+                    else:
+                        raise PublicError("Unsupported RPM payload compression")
+                    with content:
+                        require(content.peek(6)[:6] in (b"070701", b"070702"), "Unsupported RPM CPIO format")
+                        self.add(content, depth + 1)
+        except PublicError:
+            raise
+        except (EOFError, OSError, lzma.LZMAError, struct.error):
+            raise PublicError("Invalid RPM payload") from None
+
+    def cpio(self, target, depth):
+        """Inspect newc/CRC members as numeric files, never filesystem paths."""
+        with target.open("rb") as stream:
+            while True:
+                header = stream.read(110)
+                require(len(header) == 110 and header[:6] in (b"070701", b"070702")
+                        and re.fullmatch(b"[0-9a-fA-F]{104}", header[6:]) is not None, "Invalid CPIO header")
+                fields = [int(header[i:i + 8], 16) for i in range(6, 110, 8)]
+                mode, size, namesize, checksum = fields[1], fields[6], fields[11], fields[12]
+                require(1 <= namesize <= 4 * 1024**2 and size <= MAX_FILE, "CPIO member exceeds inspection bound")
+                name = stream.read(namesize)
+                require(len(name) == namesize and name.endswith(b"\0") and b"\0" not in name[:-1],
+                        "Invalid CPIO member name")
+                padding = (-(110 + namesize)) % 4
+                require(stream.read(padding) == b"\0" * padding, "Invalid CPIO padding")
+                if name == b"TRAILER!!!\0":
+                    require(size == 0 and checksum == 0, "Invalid CPIO trailer")
+                    while chunk := stream.read(1024 * 1024):
+                        require(not chunk.strip(b"\0"), "Unexpected CPIO trailing data")
+                    return
+                kind = stat.S_IFMT(mode)
+                require(kind in (stat.S_IFREG, stat.S_IFLNK, stat.S_IFDIR, stat.S_IFCHR,
+                                 stat.S_IFBLK, stat.S_IFIFO, stat.S_IFSOCK)
+                        and (kind in (stat.S_IFREG, stat.S_IFLNK) or size == 0), "Unsupported CPIO member")
+                self.metadata(name[:-1].decode("utf-8", "surrogateescape"), "", depth,
+                              mode=mode, uid=fields[2], gid=fields[3], nlink=fields[4])
+                member = MemberReader(stream, size, crc=header[:6] == b"070702")
+                self.add(member, depth + 1)
+                require(checksum == (member.checksum if member.crc else 0), "CPIO checksum mismatch")
+                padding = (-size) % 4
+                require(stream.read(padding) == b"\0" * padding, "Invalid CPIO padding")
 
 
 def inspect_oci(directory, payloads, expected_id):
