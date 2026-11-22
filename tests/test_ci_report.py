@@ -70,6 +70,24 @@ class ReportTests(unittest.TestCase):
         base = ['podman', 'run', '--rm', '--pull=never', 'example-image:pr-64-test']
         self.assertEqual(calls, [base + ['ansible-galaxy', 'collection', 'list'], base + ['ansible', '--version']])
 
+    def test_dotted_ee_name_runs_checks_and_writes_matching_report(self):
+        local_image = 'ocp-satellite-ee-4.22:pr-68-d12996d'
+        reference = 'ghcr.io/heatmiser/' + local_image
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(REPORT.generate('ee', local_image, reference, COMMIT, self.output, run=run), 0)
+        base = ['podman', 'run', '--rm', '--pull=never', local_image]
+        self.assertEqual(calls, [base + ['ansible-galaxy', 'collection', 'list'],
+                                 base + ['ansible', '--version']])
+        report = (self.output / 'commands-ocp-satellite-ee-4.22.txt').read_text()
+        self.assertIn(reference, report)
+        self.assertIn('- ansible-collections: PASS', report)
+        self.assertIn('- ansible-version: PASS', report)
+
     def test_invalid_runtime_options_cannot_execute_or_create_reports(self):
         cases = ({'network': 'host'}, {'container_env': ['AGY_HEADLESS=1']},
                  {'container_env': {'--privileged': 'true'}}, {'container_env': {'TOKEN': None}},
@@ -132,6 +150,8 @@ class ReportTests(unittest.TestCase):
     def test_invalid_metadata_stops_before_commands_or_report_creation(self):
         valid = ['image', 'example-image:tag', 'quay.io/s4v0/example-image:tag', COMMIT]
         invalid = ((0, SECRET), (1, '../example-image:tag'), (1, 'k8s-launch-kit:tag'),
+                   (1, '.example-image:tag'), (1, 'example.image/../other:tag'),
+                   (1, 'example.image:tag;id'), (1, 'example.image:tag\n'),
                    (1, 'example-image:tag\n' + SECRET), (2, 'https://registry.invalid/?auth=' + SECRET),
                    (2, 'quay.io/s4v0/other-image:tag'), (2, 'quay.io/s4v0/example-image:other-tag'),
                    (2, valid[2] + '\n::error::' + SECRET), (3, SECRET))

@@ -26,7 +26,7 @@ def require(condition):
 def generate(kind, local_image, reference, commit, output, run=None, *, network=None, container_env=None):
     run = run or subprocess.run
     require(kind in ('ee', 'image'))
-    match = re.fullmatch(r'([a-z0-9][a-z0-9_-]{0,127}):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})', local_image)
+    match = re.fullmatch(r'([a-z0-9][a-z0-9_.-]{0,127}):([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})', local_image)
     require(match is not None and match[1] != 'k8s-launch-kit')
     image = match[1]
     require(re.fullmatch(r'(?:quay\.io|ghcr\.io)/[a-z0-9_-]+/' + re.escape(local_image), reference))
