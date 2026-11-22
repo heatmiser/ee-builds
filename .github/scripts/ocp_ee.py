@@ -207,20 +207,15 @@ def execute(argv, cwd=None):
 
 
 def registry_login(registry):
-    """Authenticate without putting passwords in argv or publishing tool output."""
+    """Write credentials only to the explicit private runner authfile."""
     require(registry in LOGIN_REGISTRIES, "Unsupported registry login target")
-    environment = ci_secrets.child_env()
     username = os.environ.get("REGISTRY_USERNAME", "")
     password = os.environ.get("REGISTRY_PASSWORD", "")
     require(bool(username) and bool(password), "Registry login credentials missing")
+    require(bool(os.environ.get("REGISTRY_AUTH_FILE")), "Registry authentication file required")
     try:
-        if os.environ.get("REGISTRY_AUTH_FILE"):
-            ci_secrets.login(registry)
-            return
-        subprocess.run(["podman", "login", "--username", username, "--password-stdin", registry],
-                       input=password + "\n", text=True, capture_output=True, check=True,
-                       timeout=120, env=environment)
-    except (OSError, subprocess.SubprocessError, ValueError):
+        ci_secrets.login(registry)
+    except (KeyError, OSError, ValueError):
         # Even exception strings may include credentials or captured tool output.
         raise PublicError(f"Registry login failed for {registry}; command output suppressed") from None
 

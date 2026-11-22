@@ -15,6 +15,8 @@ import unittest
 import urllib.parse
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / ".github/scripts"))
 import ci_secrets as guard
@@ -41,6 +43,43 @@ def isolated_git_env(root, config):
 
 
 class ProtectedEEBuildTests(unittest.TestCase):
+    def test_cleaned_definitions_keep_galaxy_dependencies_without_credential_transports(self):
+        for project in ("dcm-base-ee", "dcm-bootstrap-ee", "ocp-satellite-ee-4.22"):
+            with self.subTest(project=project):
+                source = ROOT / project
+                text = (source / "execution-environment.yml").read_text()
+                definition = yaml.safe_load(text)
+                self.assertEqual(definition["version"], 3)
+                self.assertEqual(definition["dependencies"]["galaxy"], "files/requirements.yml")
+                requirements = yaml.safe_load((source / definition["dependencies"]["galaxy"]).read_text())
+                self.assertTrue(requirements["collections"])
+                for obsolete in ("COLLECTION_TOKEN", "RHVP_OCP_LANDING_ZONE_TOKEN", "RHVP_BAREMETAL_OCP_TOKEN",
+                                 "OCP_SATELLITE_TOKEN", "ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_TOKEN",
+                                 "insteadOf", "zizmor: ignore[secrets-outside-env]"):
+                    self.assertNotIn(obsolete, text)
+                prepend = definition["additional_build_steps"].get("prepend_galaxy", [])
+                if project == "ocp-satellite-ee-4.22":
+                    self.assertEqual(prepend, ["ADD _build/configs/ansible.cfg /etc/ansible/ansible.cfg"])
+                    self.assertIn({"src": "ansible.cfg", "dest": "configs"}, definition["additional_build_files"])
+                    collections = {c["name"]: c for c in requirements["collections"]}
+                    self.assertEqual(collections["elise.quadlet"]["source"],
+                                     "https://github.com/heatmiser/elise.quadlet.git")
+                    self.assertEqual(collections["heatmiser.ocp_satellite"]["source"],
+                                     "https://github.com/heatmiser/ocp_satellite.git")
+                    self.assertIn("redhat.satellite", collections)
+                else:
+                    self.assertNotIn("prepend_galaxy", definition["additional_build_steps"])
+                # Feed the cleaned prepend steps into Builder's known install shape.
+                # Actual Builder rendering remains a separate CI qualification.
+                installs = "\n".join(line for line in GENERATED.splitlines()
+                                     if line.startswith("RUN ") and "ansible-galaxy" in line)
+                generated = "FROM base as galaxy\n" + "\n".join(prepend) + "\n" + installs + "\n"
+                protected = driver.protect_containerfile(generated)
+                for mount in ("galaxy_config", "git_config", "git_credentials"):
+                    self.assertEqual(protected.count("--mount=type=secret,id=" + mount + ","), 2)
+                for line in prepend:
+                    self.assertIn(line + "\n", protected)
+
     def test_mounts_only_install_commands_and_preserves_signature_options(self):
         output = driver.protect_containerfile(GENERATED)
         self.assertEqual(output.count("--mount=type=secret,id=galaxy_config"), 2)

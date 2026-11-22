@@ -233,85 +233,103 @@ class VersionSelectionTests(unittest.TestCase):
 
 
 class RegistryLoginTests(unittest.TestCase):
-    def test_cli_login_suppresses_synthetic_secrets_on_success_and_failure(self):
+    def test_cli_login_writes_only_private_authfile_without_subprocess(self):
         username, password = "synthetic-login-user", "synthetic-login-password:/+$"
         encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-        messages = (
-            f"username={username} password={password}",
-            f"Authorization: Basic {encoded}\nAuthorization: Bearer {password}",
-            f"https://{username}:{password}@registry.invalid/\n::error::{encoded}",
-            json.dumps({"auth": encoded, "identitytoken": password}),
-            f"{username}\n{password}\n{encoded}\r\n\x1b[31m{password}\x1b[0m",
-        )
-        for registry in ("quay.io", "ghcr.io", "registry.redhat.io"):
-            for success in (True, False):
-                for index, message in enumerate(messages):
-                    with self.subTest(registry=registry, success=success, payload=index):
-                        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            auth = root / "ee-auth-registry-tests.json"
+            environment = {"RUNNER_TEMP": directory, "REGISTRY_AUTH_FILE": str(auth),
+                           "HOME": str(home), "REGISTRY_USERNAME": username, "REGISTRY_PASSWORD": password}
+            for registry in EE.LOGIN_REGISTRIES:
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(registry=registry), patch.dict(os.environ, environment, clear=True), \
+                        patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", registry]), \
+                        patch.object(EE.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    EE.main()
+                run.assert_not_called()
+                record = json.loads(auth.read_text())
+                self.assertEqual(record["auths"][registry], {"auth": encoded})
+                self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(stdout.getvalue(), f"Registry login succeeded for {registry}\n")
+                self.assertEqual(stderr.getvalue(), "")
+                for secret in (username, password, encoded):
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(set(record["auths"]), set(EE.LOGIN_REGISTRIES))
+            self.assertEqual(list(home.iterdir()), [])
+            self.assertEqual(set(root.iterdir()), {home, auth})
 
-                        def run(argv, **kwargs):
-                            self.assertEqual(argv, ["podman", "login", "--username", username,
-                                                    "--password-stdin", registry])
-                            self.assertNotIn(password, argv)
-                            self.assertEqual(kwargs["input"], password + "\n")
-                            self.assertTrue(kwargs["capture_output"])
-                            self.assertTrue(kwargs["check"])
-                            self.assertEqual(kwargs["timeout"], 120)
-                            self.assertNotIn("REGISTRY_USERNAME", kwargs["env"])
-                            self.assertNotIn("REGISTRY_PASSWORD", kwargs["env"])
-                            if not success:
-                                raise subprocess.CalledProcessError(125, argv, output=message, stderr=message)
-                            return subprocess.CompletedProcess(argv, 0, stdout=message, stderr=message)
-
-                        with patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
-                                patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", registry]), \
-                                patch.object(EE.subprocess, "run", side_effect=run), \
-                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                            if success:
-                                EE.main()
-                            else:
-                                with self.assertRaises(SystemExit) as error:
-                                    EE.main()
-                                self.assertEqual(error.exception.code, 1)
-                        if success:
-                            self.assertEqual(stdout.getvalue(), f"Registry login succeeded for {registry}\n")
-                            self.assertEqual(stderr.getvalue(), "")
-                        else:
-                            self.assertEqual(stdout.getvalue(), "")
-                            self.assertEqual(stderr.getvalue(),
-                                             f"ERROR: OCP EE registry-login failed: Registry login failed for {registry}; "
-                                             "command output suppressed; preserve build evidence.\n")
-                        for secret in (username, password, encoded):
-                            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+    def test_missing_or_unsafe_authfiles_never_fall_back_to_subprocess(self):
+        username, password = "synthetic-login-user", "synthetic-login-password:/+$"
+        encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "untouched.json"
+            target.write_text("untouched")
+            link = root / "ee-auth-link.json"
+            link.symlink_to(target)
+            cases = ({}, {"REGISTRY_AUTH_FILE": ""},
+                     {"REGISTRY_AUTH_FILE": "ee-auth-relative.json"},
+                     {"REGISTRY_AUTH_FILE": str(root.parent / "ee-auth-outside.json")},
+                     {"REGISTRY_AUTH_FILE": str(root / "wrong-prefix.json")},
+                     {"REGISTRY_AUTH_FILE": str(link)},
+                     {"REGISTRY_AUTH_FILE": str(root / "ee-auth-valid.json"), "RUNNER_TEMP": ""})
+            for overrides in cases:
+                environment = {"RUNNER_TEMP": directory, "REGISTRY_USERNAME": username,
+                               "REGISTRY_PASSWORD": password, **overrides}
+                if overrides.get("RUNNER_TEMP") == "":
+                    del environment["RUNNER_TEMP"]
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(overrides=overrides), patch.dict(os.environ, environment, clear=True), \
+                        patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", "quay.io"]), \
+                        patch.object(EE.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        EE.main()
+                self.assertEqual(caught.exception.code, 1)
+                run.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                expected = ("Registry authentication file required" if not overrides.get("REGISTRY_AUTH_FILE")
+                            else "Registry login failed for quay.io; command output suppressed")
+                self.assertEqual(stderr.getvalue(), f"ERROR: OCP EE registry-login failed: {expected}; "
+                                 "preserve build evidence.\n")
+                for secret in (username, password, encoded):
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(target.read_text(), "untouched")
+            self.assertEqual(set(root.iterdir()), {target, link})
 
     def test_login_runtime_exceptions_do_not_expose_credentials(self):
         secret = "synthetic-exception-secret"
-        errors = (OSError(secret), ValueError(secret),
-                  subprocess.TimeoutExpired(["podman", "login", secret], 120, output=secret, stderr=secret))
-        for error in errors:
+        for error in (OSError(secret), ValueError(secret), KeyError(secret)):
             with self.subTest(error=type(error).__name__), \
-                    patch.dict(os.environ, REGISTRY_USERNAME="synthetic-user", REGISTRY_PASSWORD=secret), \
-                    patch.object(EE.subprocess, "run", side_effect=error), \
+                    patch.dict(os.environ, REGISTRY_USERNAME="synthetic-user", REGISTRY_PASSWORD=secret,
+                               REGISTRY_AUTH_FILE="/unused/ee-auth-tests.json"), \
+                    patch.object(EE.ci_secrets, "login", side_effect=error), \
+                    patch.object(EE.subprocess, "run") as run, \
                     self.assertRaises(ValueError) as failure:
                 EE.registry_login("quay.io")
+            run.assert_not_called()
             self.assertEqual(str(failure.exception),
                              "Registry login failed for quay.io; command output suppressed")
             self.assertIsNone(failure.exception.__cause__)
             self.assertTrue(failure.exception.__suppress_context__)
 
-    def test_missing_credentials_and_unapproved_registries_fail_before_podman(self):
+    def test_missing_credentials_and_unapproved_registries_fail_before_authfile_write(self):
         for username, password in (("", ""), ("user", ""), ("", "password")):
             with self.subTest(username_present=bool(username), password_present=bool(password)), \
                     patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
-                    patch.object(EE.subprocess, "run") as run, \
+                    patch.object(EE.ci_secrets, "login") as login, \
                     self.assertRaisesRegex(ValueError, "Registry login credentials missing"):
                 EE.registry_login("quay.io")
-            run.assert_not_called()
-        with patch.object(EE.subprocess, "run") as run, \
+            login.assert_not_called()
+        with patch.object(EE.ci_secrets, "login") as login, \
                 self.assertRaisesRegex(ValueError, "Unsupported registry login target"):
             username, password = "user", "password"
             EE.registry_login(f"https://{username}:{password}@unknown.invalid")
-        run.assert_not_called()
+        login.assert_not_called()
 
 
 class PublicOutputTests(unittest.TestCase):
