@@ -29,16 +29,6 @@ additional_build_steps:
     # runtime, not the oc binary, so no real binary is needed in this EE.
     - "RUN microdnf install -y rpm-build && { echo 'Name: openshift-clients'; echo 'Version: 0.0.0'; echo 'Release: 0'; echo 'Summary: OpenShift client tools stub'; echo 'License: ASL 2.0'; echo 'BuildArch: noarch'; echo ''; echo '%description'; echo 'Stub — satisfies kubernetes.core bindep check.'; echo ''; echo '%prep'; echo '%build'; echo '%install'; echo ''; echo '%files'; } > /tmp/oc.spec && rpmbuild --define '_topdir /tmp/rpmbuild' -bb /tmp/oc.spec && rpm -ivh /tmp/rpmbuild/RPMS/noarch/openshift-clients-0.0.0-0.noarch.rpm && microdnf remove -y rpm-build && microdnf clean all && rm -rf /tmp/rpmbuild /tmp/oc.spec"
 
-  prepend_galaxy:
-    # COLLECTION_TOKEN is the legacy broad-access secret passed by the base-branch
-    # workflow during the pull_request_target transition. Per-repo tokens override it
-    # once the new workflow lands on main.
-    - ARG COLLECTION_TOKEN
-    - ARG RHVP_OCP_LANDING_ZONE_TOKEN=${COLLECTION_TOKEN}
-    - RUN git config --global url."https://${RHVP_OCP_LANDING_ZONE_TOKEN}@github.com/heatmiser/rhvp.ocp_landing_zone".insteadOf "https://github.com/heatmiser/rhvp.ocp_landing_zone"
-    - ARG RHVP_BAREMETAL_OCP_TOKEN=${COLLECTION_TOKEN}
-    - RUN git config --global url."https://${RHVP_BAREMETAL_OCP_TOKEN}@github.com/heatmiser/rhvp.baremetal_ocp".insteadOf "https://github.com/heatmiser/rhvp.baremetal_ocp"
-
   append_builder:
     # assemble removes pip as a cleanup step. Re-bootstrap it here so pip is present
     # in the builder stage's final filesystem state. COPY --from=builder in the
@@ -48,6 +38,13 @@ additional_build_steps:
     - RUN $PYCMD -m ensurepip --upgrade
 
   append_final:
+    # Podman engines and clients must not be installed in this EE. Check both
+    # executable lookup and the RPM inventory; an RPM query failure also fails.
+    - >-
+      RUN $PYCMD -c 'import shutil, subprocess, sys;
+      installed = subprocess.check_output(["rpm", "-qa", "--qf", "%{NAME}\n"], text=True).splitlines();
+      forbidden = any(shutil.which(name) or name in installed for name in ("podman", "podman-remote"));
+      sys.exit("Podman is forbidden in dcm-bootstrap-ee" if forbidden else 0)'
     - LABEL maintainer="Mike Savage"
     - LABEL quay.expires-after="45d"
 ...

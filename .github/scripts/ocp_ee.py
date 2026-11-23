@@ -14,8 +14,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import urllib.request
 from urllib.parse import urlsplit
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ee_projects import CatalogError, is_active, load_catalog, require_active
+import ci_secrets
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -81,11 +86,28 @@ def image_name(version):
     return f"dcm-ocp-ee-{stream}"
 
 
+def check_stream(stream, config=None, catalog=None):
+    config = configuration() if config is None else config
+    catalog = load_catalog(ROOT) if catalog is None else catalog
+    require(isinstance(stream, str) and re.fullmatch(STREAM_PATTERN, stream), "Invalid OpenShift stream")
+    require(stream in config["streams"] or stream in config["legacy_streams"], "OpenShift stream is not configured")
+    definition = config["streams"][stream]["definition"] if stream in config["streams"] else f"dcm-ocp-ee-{stream}"
+    require_active(definition, catalog=catalog)
+    return definition
+
+
 def automation_matrix():
     config = configuration()
-    entries = [{"ocp_version": stream, "versioned": False} for stream in config["legacy_streams"]]
-    entries += [{"ocp_version": stream, "versioned": True}
-                for stream, settings in config["streams"].items() if settings["automatic"]]
+    catalog = load_catalog(ROOT)
+    entries = []
+    candidates = [(stream, False, f"dcm-ocp-ee-{stream}") for stream in config["legacy_streams"]]
+    candidates += [(stream, True, settings["definition"]) for stream, settings in config["streams"].items()
+                   if settings["automatic"]]
+    for stream, versioned, definition in candidates:
+        if is_active(definition, catalog):
+            entries.append({"ocp_version": stream, "versioned": versioned})
+        else:
+            print(f"Skip example-only dependent EE: {definition}", file=sys.stderr)
     return {"include": entries}
 
 
@@ -95,6 +117,7 @@ def release_matrix(value):
             "Supply 1-16 distinct exact releases")
     for version in versions:
         stream_settings(release_stream(version))
+        check_stream(release_stream(version))
     return {"include": [{"release": version, "stream": release_stream(version)} for version in versions]}
 
 
@@ -173,23 +196,26 @@ def execute(argv, cwd=None):
         log_name = "builder.log" if argv[0] == "ansible-builder" else "build.log"
         with (Path(cwd).parent / log_name).open("w") as log:
             subprocess.run(argv, cwd=cwd, check=True, text=True, stdout=log,
-                           stderr=subprocess.STDOUT, timeout=3600)
+                           stderr=subprocess.STDOUT, timeout=3600, env=ci_secrets.child_env())
+        ci_secrets.inspect_paths([Path(cwd).parent / log_name])
         return ""
-    return subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True, timeout=3600).stdout
+    result = subprocess.run(argv, cwd=cwd, check=True, text=True, capture_output=True, timeout=3600,
+                            env=ci_secrets.child_env())
+    ci_secrets.inspect_bytes(result.stdout or "")
+    ci_secrets.inspect_bytes(result.stderr or "")
+    return result.stdout
 
 
 def registry_login(registry):
-    """Authenticate without putting passwords in argv or publishing tool output."""
+    """Write credentials only to the explicit private runner authfile."""
     require(registry in LOGIN_REGISTRIES, "Unsupported registry login target")
-    environment = dict(os.environ)
-    username = environment.pop("REGISTRY_USERNAME", "")
-    password = environment.pop("REGISTRY_PASSWORD", "")
+    username = os.environ.get("REGISTRY_USERNAME", "")
+    password = os.environ.get("REGISTRY_PASSWORD", "")
     require(bool(username) and bool(password), "Registry login credentials missing")
+    require(bool(os.environ.get("REGISTRY_AUTH_FILE")), "Registry authentication file required")
     try:
-        subprocess.run(["podman", "login", "--username", username, "--password-stdin", registry],
-                       input=password + "\n", text=True, capture_output=True, check=True,
-                       timeout=120, env=environment)
-    except (OSError, subprocess.SubprocessError, ValueError):
+        ci_secrets.login(registry)
+    except (KeyError, OSError, ValueError):
         # Even exception strings may include credentials or captured tool output.
         raise PublicError(f"Registry login failed for {registry}; command output suppressed") from None
 
@@ -285,7 +311,7 @@ def pinned_base(reference, run=execute):
     return candidates[0]
 
 
-def prepare_pr(run=execute):
+def pr_matrix():
     settings = configuration().get("pr_qualification")
     require(isinstance(settings, dict), "Require PR qualification settings")
     versions = settings.get("versions")
@@ -293,7 +319,12 @@ def prepare_pr(run=execute):
             "Require 1-16 exact PR qualification releases")
     for version in versions:
         release_version(version)
-    matrix = release_matrix(",".join(versions))
+    return release_matrix(",".join(versions))
+
+
+def prepare_pr(run=execute):
+    matrix = pr_matrix()
+    settings = configuration()["pr_qualification"]
     base = settings.get("base_image")
     require(isinstance(base, str), "Require a published PR base image reference")
     return {"matrix": matrix, "base": pinned_base(base, run)}
@@ -312,7 +343,9 @@ def verify_tools(version, installer, client):
 
 def write_receipt(path, record):
     validate_receipt(record)
-    path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+    content = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    ci_secrets.inspect_bytes(content)
+    path.write_text(content)
 
 
 def normalize_image_id(value):
@@ -372,6 +405,9 @@ def validate_receipt(record):
 
 
 def build(selection, base, commit, run_id, output, pr="", run=execute, opener=urllib.request.urlopen):
+    # Resolve eligibility before mirror reads, source staging or container commands.
+    requested_stream = selection.removeprefix("stable-") if selection.startswith("stable-") else release_stream(selection)
+    check_stream(requested_stream)
     version = resolve_release(selection, opener)
     stream = release_stream(version)
     settings = stream_settings(stream)
@@ -414,6 +450,8 @@ def build(selection, base, commit, run_id, output, pr="", run=execute, opener=ur
               "commit": commit, "run_id": run_id, "base_image": base_digest,
               "archive_sha256": archive_hashes, "release_image": payload,
               "verified_at": datetime.now(timezone.utc).isoformat()}
+    ci_secrets.inspect_paths([source, context])
+    ci_secrets.inspect_image("sha256:" + image_id)
     write_receipt(output / "receipt.json", record)
     return output / "receipt.json"
 
@@ -422,6 +460,7 @@ def publish(receipt, registry, run=execute):
     require(re.fullmatch(r"(?:quay\.io|ghcr\.io)/[a-z0-9_-]+", registry), "Invalid image registry namespace")
     record = json.loads(receipt.read_text())
     validate_receipt(record)
+    check_stream(record["stream"])
     image = image_name(record["release"])
     require(bool(record["pr"]) == registry.startswith("ghcr.io/"), "PR builds publish only to GHCR; releases only to Quay")
     record["image_id"] = normalize_image_id(record["image_id"])
@@ -431,6 +470,8 @@ def publish(receipt, registry, run=execute):
     client = checked_operation("publication client verification",
         ["podman", "run", "--rm", "--pull=never", record["image_id"], "oc", "version", "--client"], run)
     require(verify_tools(record["release"], installer, client) == record["release_image"], "Release payload changed")
+    ci_secrets.inspect_bytes(json.dumps(record))
+    ci_secrets.inspect_image("sha256:" + record["image_id"])
     destinations, expected_digest = [], None
     for index, tag in enumerate(record["tags"]):
         destination = f"{registry}/{image}:{tag}"
@@ -455,6 +496,9 @@ def main():
     matrix = commands.add_parser("matrix")
     matrix.add_argument("--versions", required=True)
     commands.add_parser("automation-matrix")
+    commands.add_parser("check-pr")
+    stream_check = commands.add_parser("check-stream")
+    stream_check.add_argument("--stream", required=True)
     commands.add_parser("prepare-pr")
     login = commands.add_parser("registry-login")
     login.add_argument("--registry", required=True, choices=LOGIN_REGISTRIES)
@@ -474,13 +518,22 @@ def main():
             print(json.dumps(release_matrix(args.versions)))
         elif args.command == "automation-matrix":
             print(json.dumps(automation_matrix()))
+        elif args.command == "check-pr":
+            print(json.dumps(pr_matrix()))
+        elif args.command == "check-stream":
+            check_stream(args.stream)
+            print("OpenShift EE project is active")
         elif args.command == "prepare-pr":
-            print(json.dumps(prepare_pr()))
+            content = json.dumps(prepare_pr())
+            ci_secrets.inspect_bytes(content)
+            print(content)
         elif args.command == "registry-login":
             registry_login(args.registry)
             print(f"Registry login succeeded for {args.registry}")
         elif args.command == "resolve-base":
-            print(pinned_base(args.reference))
+            reference = pinned_base(args.reference)
+            ci_secrets.inspect_bytes(reference)
+            print(reference)
         elif args.command == "build":
             receipt = build(args.release, args.base, args.commit, args.run_id, args.output, args.pr)
             print(receipt)
@@ -493,14 +546,20 @@ def main():
                        + f"\nRelease payload: `{record['release_image']}`\n"
                        + f"\nArchive SHA256: `{json.dumps(record['archive_sha256'], sort_keys=True)}`\n"
                        + f"\nSource: `{record['commit']}`; run: `{record['run_id']}`\n")
+            ci_secrets.inspect_bytes(summary)
             print(summary)
             if os.environ.get("GITHUB_STEP_SUMMARY"):
                 with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
                     stream.write(summary)
     except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
         # Do not echo captured command output: inherited build steps may contain credentials.
-        detail = str(error) if isinstance(error, PublicError) else type(error).__name__
-        parser.exit(1, f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n")
+        detail = str(error) if isinstance(error, (PublicError, CatalogError)) else type(error).__name__
+        message = f"ERROR: OCP EE {args.command} failed: {detail}; preserve build evidence.\n"
+        try:
+            ci_secrets.inspect_bytes(message)
+        except ci_secrets.GuardError:
+            message = "ERROR: credential protection denied operation\n"
+        parser.exit(1, message)
 
 
 if __name__ == "__main__":

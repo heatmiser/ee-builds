@@ -1,146 +1,135 @@
+---
 name: Devel Image Build
 
 on:
   pull_request:
-    branches:
-      - main
+    branches: [main]
     types: [opened, reopened, synchronize]
     paths:
+      - '.github/scripts/ci_secrets.py'
+      - 'tests/test_ci_secrets.py'
       - '**/Containerfile'
       - '**/image.yaml'
       - '**/*entrypoint.sh'
       - '**/README.md'
       - 'k8s-launch-kit/**'
+      - '.github/scripts/ci_publication.py'
+      - '.github/scripts/ci_report.py'
+      - '.github/workflows/pr-image-build.yml'
+      - '.github/workflows/push-image-build.yml'
   workflow_dispatch:
+    inputs:
+      image_name:
+        description: 'Plain-container project to build, or all five'
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - antigravity-ai-helpers
+          - codex-ai-helpers
+          - gemini-ai-helpers
+          - opencode-ai-helpers
+          - k8s-launch-kit
+
+permissions:
+  contents: read
 
 jobs:
   prepare-matrix:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      length: ${{ steps.set-matrix.outputs.length }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      length: ${{ steps.select.outputs.length }}
+      commit: ${{ steps.select.outputs.commit }}
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-      with:
-        repository: ${{ github.event.pull_request.head.repo.full_name }}
-        fetch-depth: 0
-        ref: ${{ github.event.pull_request.head.sha }}
+      - name: Checkout source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
-    - name: Generate matrix
-      id: generate-matrix
-      run: |
-        echo $GITHUB_BASE_REF
-        echo $GITHUB_HEAD_REF
-        python -u .github/workflows/generate_image_matrix.py \
-        --start-ref origin/$GITHUB_BASE_REF \
-        --end-ref $GITHUB_HEAD_REF \
-        --output-path matrix_output.json
-
-    - name: Read matrix
-      id: set-matrix
-      run: |
-        MATRIX_JSON=$(cat matrix_output.json)
-        echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
-        MATRIX_LENGTH=$(echo $MATRIX_JSON | jq '.include | length')
-        echo $MATRIX_LENGTH
-        echo "length=$MATRIX_LENGTH" >> $GITHUB_OUTPUT
+      - name: Validate event and select images
+        id: select
+        run: |
+          python3 .github/scripts/ci_publication.py prepare \
+            --channel devel --output "$RUNNER_TEMP/plain-image-selection"
 
   build-image:
-    needs: [prepare-matrix]
-    # Temporary gate while public output and comment publication are hardened.
-    # Re-enable only after explicit review of the remaining publication paths.
-    if: ${{ false }}
+    needs: prepare-matrix
+    if: ${{ needs.prepare-matrix.outputs.length != '0' }}
     runs-on: ubuntu-latest
     environment: test
     strategy:
-      matrix: ${{fromJson(needs.prepare-matrix.outputs.matrix)}}
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
       fail-fast: false
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
-        with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Define environment variables
+      - name: Initialize job registry authentication
+        shell: bash
         run: |
-          echo "IMAGE=${{ matrix.image }}" >> $GITHUB_ENV
-          SHORT_SHA=$(echo ${{ github.event.pull_request.head.sha }} | cut -c1-7)
-          echo "IMAGE_TAG=pr-${{ github.event.number }}-$SHORT_SHA" >> $GITHUB_ENV
-          echo "IMAGE_REGISTRY=ghcr.io" >> $GITHUB_ENV
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-pr-image-build-build-image.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      - name: Login to ghcr
-        uses: redhat-actions/podman-login@v1
+      - name: Checkout selected source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          registry: ${{ env.IMAGE_REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ needs.prepare-matrix.outputs.commit }}
+          persist-credentials: false
 
-      - name: Build image and create artifact
-        if: matrix.image != 'k8s-launch-kit'
-        working-directory: ${{ matrix.image }}
-        run: |
-          podman build \
-          --tag=${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
-          --tag=${{ env.IMAGE }}:${{ github.sha }} \
-          .
-
-      - name: Generate bounded build report
-        if: matrix.image != 'k8s-launch-kit'
+      - name: Build, verify and scan image
         env:
-          REPORT_LOCAL_IMAGE: ${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
-          REPORT_REFERENCE: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
-          REPORT_COMMIT: ${{ github.event.pull_request.head.sha }}
-          REPORT_OUTPUT: ${{ runner.temp }}/ci-report-${{ matrix.image }}
+          IMAGE_PROJECT: ${{ matrix.image }}
+          CI_SECRET_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          python3 .github/scripts/ci_report.py --kind image \
-            --local-image "$REPORT_LOCAL_IMAGE" --reference "$REPORT_REFERENCE" \
-            --commit "$REPORT_COMMIT" --output "$REPORT_OUTPUT"
+          python3 .github/scripts/ci_publication.py build \
+            --project "$IMAGE_PROJECT" --channel devel \
+            --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
 
-      - name: Build and verify l8k image
-        if: matrix.image == 'k8s-launch-kit'
-        working-directory: k8s-launch-kit
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./ci-build.sh "$GITHUB_WORKSPACE/tmp/l8k-ci" "$IMAGE" "$IMAGE_TAG" "$GITHUB_SHA"
-
-      - name: Upload l8k build evidence
-        if: ${{ always() && matrix.image == 'k8s-launch-kit' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: l8k-build-evidence
-          path: |
-            tmp/l8k-ci/public/receipt.json
-            tmp/l8k-ci/public/summary.txt
-            tmp/l8k-ci/public/commands-k8s-launch-kit.txt
-            tmp/l8k-ci/public/SHA256SUMS
-          retention-days: 7
-          if-no-files-found: warn
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/receipt.json" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/report.txt" \
+            "${{ runner.temp }}/plain-image-${{ matrix.image }}/public/SHA256SUMS"
 
       - name: Upload build artifact
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: commands-${{ matrix.image }}
-          path: ${{ matrix.image == 'k8s-launch-kit' && 'tmp/l8k-ci/public/commands-k8s-launch-kit.txt' || format('{0}/ci-report-{1}/commands-{1}.txt', runner.temp, matrix.image) }}
+          name: image-checks-${{ matrix.image }}
+          path: |
+            ${{ runner.temp }}/plain-image-${{ matrix.image }}/public/receipt.json
+            ${{ runner.temp }}/plain-image-${{ matrix.image }}/public/report.txt
+            ${{ runner.temp }}/plain-image-${{ matrix.image }}/public/SHA256SUMS
           retention-days: 7
+          if-no-files-found: error
 
-      - name: Push To GHCR
-        uses: redhat-actions/push-to-registry@94ade333c38ecc0e60e94785125d9a52ca423b37  # v3
-        with:
-          image: ${{ env.IMAGE }}
-          tags: ${{ env.IMAGE_TAG }}
-          registry: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}
-
-      - name: Print summary
+      - name: Publish inspected image after hosted qualification
+        # Build execution is enabled. Publication remains separately held.
+        if: ${{ false }}
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_PROJECT: ${{ matrix.image }}
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ github.token }}
         run: |
-          echo "## :rocket: Usage" >> $GITHUB_STEP_SUMMARY
-          echo "Image pushed to repository: ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
-          echo "> \`podman pull ${{ env.IMAGE_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          python3 .github/scripts/ci_publication.py publish \
+            --project "$IMAGE_PROJECT" --channel devel \
+            --output "$RUNNER_TEMP/plain-image-$IMAGE_PROJECT"
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   post-comment:
     needs: build-image
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      needs.build-image.result == 'success' && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -156,3 +145,4 @@ jobs:
               issue_number: context.issue.number,
               body: `Build job completed. Bounded check reports are available in the [workflow run](${runUrl}).`
             });
+...

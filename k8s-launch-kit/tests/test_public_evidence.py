@@ -162,11 +162,38 @@ class PublicEvidenceTests(unittest.TestCase):
         self.receipt.write_text(SECRET)
         stdout, stderr = io.StringIO(), io.StringIO()
         from unittest.mock import patch
-        with patch('sys.argv', ['public-evidence.py', 'image-id', '--results', str(self.results)]), \
-                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            self.assertEqual(PUBLIC.main(), 1)
+        for mode in ('image-id', 'verified-json'):
+            with patch('sys.argv', ['public-evidence.py', mode, '--results', str(self.results)]), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(PUBLIC.main(), 1)
         self.assertEqual(stdout.getvalue(), '')
-        self.assertEqual(stderr.getvalue(), 'L8K public evidence rejected; details suppressed.\n')
+        self.assertEqual(stderr.getvalue(), 'L8K public evidence rejected; details suppressed.\n' * 2)
+
+    def test_verified_json_cli_exports_only_validated_metadata_without_creating_artifacts(self):
+        self.raw.update(reason=SECRET, commands=[{'argv': [SECRET]}])
+        self.receipt.write_text(json.dumps(self.raw))
+        proc = subprocess.run([sys.executable, str(ROOT / 'public-evidence.py'), 'verified-json',
+                               '--results', str(self.results)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, '')
+        record = json.loads(proc.stdout)
+        self.assertEqual(record, PUBLIC.verified_build(self.results, self.lock_path))
+        self.assertEqual(set(record), {'version', 'sourceRevision', 'buildDate', 'imageID', 'lockSHA256',
+                                      'sourceTreeDigest', 'platform', 'builderImage', 'runtimeImage'})
+        self.assertNotIn(SECRET, proc.stdout)
+        self.assertFalse((self.results / 'public').exists())
+        legacy = subprocess.run([sys.executable, str(ROOT / 'public-evidence.py'), 'image-id',
+                                 '--results', str(self.results)], capture_output=True, text=True, timeout=10)
+        self.assertEqual((legacy.returncode, legacy.stdout, legacy.stderr), (0, IMAGE_ID + '\n', ''))
+
+    def test_verified_json_cli_rejects_invalid_receipt_without_printing_raw_content(self):
+        self.receipt.write_text(SECRET)
+        proc = subprocess.run([sys.executable, str(ROOT / 'public-evidence.py'), 'verified-json',
+                               '--results', str(self.results)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, '')
+        self.assertEqual(proc.stderr, 'L8K public evidence rejected; details suppressed.\n')
+        self.assertFalse((self.results / 'public').exists())
 
     def test_wrapper_captures_output_and_prevents_tagging_after_failed_checks(self):
         # Run the real shell wrapper/exporter with stand-ins for tests, build and Podman.
@@ -250,22 +277,21 @@ class WorkflowPublicationTests(unittest.TestCase):
         for name, days in (('pr-image-build.yml', '7'), ('push-image-build.yml', '30')):
             with self.subTest(workflow=name):
                 text = (ROOT.parent / '.github/workflows' / name).read_text()
-                evidence = re.search(r'      - name: Upload l8k build evidence\n(.*?)(?=\n      - name:)',
-                                     text, re.S)[1]
-                paths = re.findall(r'^            (.+)$', evidence, re.M)
-                self.assertEqual(paths, ['tmp/l8k-ci/public/' + n for n in PUBLIC.PUBLIC_FILES])
-                self.assertIn('          retention-days: ' + days + '\n', evidence)
                 commands = re.search(r'      - name: Upload build artifact\n(.*?)(?=\n      - name:)',
                                      text, re.S)[1]
-                self.assertIn("matrix.image == 'k8s-launch-kit'", commands)
-                self.assertIn("'tmp/l8k-ci/public/commands-k8s-launch-kit.txt'", commands)
+                paths = re.findall(r'^            (.+)$', commands, re.M)
+                self.assertEqual(paths, ['${{ runner.temp }}/plain-image-${{ matrix.image }}/public/' + n
+                                         for n in ('receipt.json', 'report.txt', 'SHA256SUMS')])
                 self.assertIn('          retention-days: ' + days + '\n', commands)
+                self.assertIn('          if-no-files-found: error\n', commands)
+                self.assertNotIn('if: always()', commands)
 
-    def test_pr_image_build_remains_disabled_during_hardening(self):
+    def test_pr_image_build_is_enabled_while_publication_remains_held(self):
         text = (ROOT.parent / '.github/workflows/pr-image-build.yml').read_text()
         job = re.search(r'^  build-image:\n(.*?)(?=^  [a-z-]+:)', text, re.M | re.S)[1]
-        self.assertIn('    if: ${{ false }}\n', job)
-        self.assertNotIn("needs.prepare-matrix.outputs.length != '0'", job)
+        self.assertIn("    if: ${{ needs.prepare-matrix.outputs.length != '0' }}\n", job)
+        publish = re.search(r'      - name: Publish inspected image after hosted qualification\n(.*)', job, re.S)[1]
+        self.assertIn('        if: ${{ false }}\n', publish)
         self.assertIn('  post-comment:\n    needs: build-image\n', text)
 
 

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Generate credential-free EE contexts and mount credentials only for Galaxy."""
+
+import argparse
+import configparser
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import tempfile
+import urllib.parse
+
+import ci_secrets as guard
+from ee_projects import require_active
+
+
+ROOT = Path(__file__).resolve().parents[2]
+GIT_REPOS = {"RHVP_OCP_LANDING_ZONE_TOKEN": "rhvp.ocp_landing_zone",
+             "RHVP_BAREMETAL_OCP_TOKEN": "rhvp.baremetal_ocp",
+             "OCP_SATELLITE_TOKEN": "ocp_satellite"}
+BUILD_STAGES = frozenset({"eligibility", "identity", "workspace", "builder-create", "context-protection",
+                          "credential-configuration", "podman-build", "image-inspection", "workspace-cleanup", "unknown"})
+
+
+class BuildError(guard.GuardError):
+    """Only fixed stage/category metadata may cross the CLI output boundary."""
+
+    def __init__(self, stage, category, *, sources=(), stream="unknown", command_status="unknown"):
+        self.stage = stage if isinstance(stage, str) and stage in BUILD_STAGES else "unknown"
+        super().__init__("Protected EE build failed", category=category, sources=sources,
+                         stream=stream, command_status=command_status)
+
+
+def protect_containerfile(text):
+    """Remove legacy transports, then scope mounts to actual Galaxy invocations."""
+    lines, mounts = [], 0
+    for line in text.splitlines():
+        if re.match(r"\s*(?:ARG|ENV)\s+(?:COLLECTION_TOKEN|AH_TOKEN|RHVP_OCP_LANDING_ZONE_TOKEN|RHVP_BAREMETAL_OCP_TOKEN|OCP_SATELLITE_TOKEN)\b", line):
+            continue
+        if line.startswith("ENV ANSIBLE_GALAXY_SERVER_AUTOMATION_HUB_TOKEN="):
+            continue
+        if line.startswith("RUN git config --global url.") and any(name in line for name in (*GIT_REPOS, "COLLECTION_TOKEN")):
+            continue
+        if any(re.search(r"\$\{?" + name + r"\b", line) for name in (*GIT_REPOS, "COLLECTION_TOKEN", "AH_TOKEN")):
+            raise guard.GuardError("Unsupported credential transport in generated context")
+        if line.startswith("RUN ") and re.search(r"\bansible-galaxy\s+(?:role|collection)\s+install\b", line):
+            if "--mount=" in line or line.endswith("\\"):
+                raise guard.GuardError("Unsupported Galaxy instruction shape")
+            line = ("RUN --mount=type=secret,id=galaxy_config,target=/run/secrets/ansible.cfg "
+                    "--mount=type=secret,id=git_config,target=/run/secrets/gitconfig "
+                    "--mount=type=secret,id=git_credentials,target=/run/secrets/git-credentials "
+                    "ANSIBLE_CONFIG=/run/secrets/ansible.cfg GIT_CONFIG_GLOBAL=/run/secrets/gitconfig "
+                    "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false " + line[4:])
+            mounts += 1
+        lines.append(line)
+    if not mounts and re.search(r"(?im)^FROM .+ as galaxy$", text):
+        raise guard.GuardError("Generated context has no recognized Galaxy operation")
+    return "\n".join(lines) + "\n"
+
+
+def write_git_credentials(config, credentials, *, mounted_path="/run/secrets/git-credentials"):
+    """Keep clone URLs clean and serve only repository-matched, read-only credentials."""
+    entries = []
+    for key, repo in GIT_REPOS.items():
+        token = guard.value(key)
+        if any(c in token for c in "\r\n\0"):
+            raise guard.GuardError("Invalid Git credential")
+        if token:
+            for suffix in ("", ".git"):
+                entries.append("https://" + guard.GIT_AUTH_USERNAME + ":" + urllib.parse.quote(token, safe="")
+                               + "@github.com/heatmiser/" + repo + suffix + "\n")
+    # A read-only wrapper ignores Git's store/erase operations. Clearing inherited
+    # helpers prevents fallback to a credential cache or writes to image storage.
+    helper = ('!f() { if test "$1" = get; then git credential-store --file '
+              + shlex.quote(mounted_path) + ' get; fi; }; f')
+    config.write_text('[credential]\n\tuseHttpPath = true\n\thelper =\n\thelper = ' + json.dumps(helper) + '\n')
+    credentials.write_text("".join(entries))
+
+
+def build(project, tag, commit):
+    stage = "eligibility"
+    try:
+        require_active(project, root=ROOT)
+        stage = "identity"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", tag) or not re.fullmatch(r"[a-f0-9]{40}", commit):
+            raise guard.GuardError("Invalid build identity")
+        if guard.captured(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip() != commit:
+            raise guard.GuardError("Checkout differs from requested build")
+        stage = "workspace"
+        with tempfile.TemporaryDirectory(prefix="ee-build-", dir=os.environ.get("RUNNER_TEMP")) as name:
+            work = Path(name)
+            source = work / project
+            shutil.copytree(ROOT / project, source)
+            shutil.copyfile(ROOT / "ansible.cfg", work / "ansible.cfg")
+            context = work / "context"
+            stage = "builder-create"
+            guard.captured(["ansible-builder", "create", "--verbosity=3", "--file", "execution-environment.yml",
+                            "--context", str(context)], cwd=source, capture_result=False)
+            stage = "context-protection"
+            containerfile = context / "Containerfile"
+            containerfile.write_text(protect_containerfile(containerfile.read_text()))
+            guard.inspect_paths([context])
+            # Secret files are siblings of context, never copied into it or passed
+            # as ARG/ENV. Podman mounts them for each Galaxy RUN only.
+            stage = "credential-configuration"
+            config = work / "galaxy.cfg"
+            git = work / "git.cfg"
+            credentials = work / "git-credentials"
+            for path in (config, git, credentials):
+                path.touch(mode=0o600, exist_ok=False)
+            token = guard.value("AH_TOKEN")
+            if "\n" in token or "\r" in token:
+                raise guard.GuardError("Invalid Automation Hub credential")
+            settings = configparser.ConfigParser(interpolation=None)
+            settings.read(source / "ansible.cfg" if (source / "ansible.cfg").is_file() else ROOT / "ansible.cfg")
+            if token:
+                settings["galaxy_server.automation_hub"]["token"] = token
+            else:
+                settings.remove_section("galaxy_server.automation_hub")
+                settings["galaxy"]["server_list"] = "release_galaxy"
+            with config.open("w") as stream:
+                settings.write(stream)
+            write_git_credentials(git, credentials)
+            stage = "podman-build"
+            guard.captured(["podman", "build", "--secret", f"id=galaxy_config,src={config}",
+                            "--secret", f"id=git_config,src={git}",
+                            "--secret", f"id=git_credentials,src={credentials}", "--tag", f"{project}:{tag}",
+                            "--tag", f"{project}:{commit}", str(context)], cwd=context, capture_result=False)
+            stage = "image-inspection"
+            guard.inspect_image(f"{project}:{tag}")
+            stage = "workspace-cleanup"
+    except (ValueError, KeyError, TypeError, OSError, configparser.Error) as error:
+        raise BuildError(stage, guard.error_category(error), **guard.error_metadata(error)) from None
+
+
+def main():
+    os.umask(0o077)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--commit", required=True)
+    args = parser.parse_args()
+    try:
+        build(args.project, args.tag, args.commit)
+    except (ValueError, KeyError, TypeError, OSError, configparser.Error) as error:
+        stage = error.stage if isinstance(error, BuildError) and error.stage in BUILD_STAGES else "unknown"
+        message = f"ERROR: protected EE build failed; stage={stage}; category={guard.error_category(error)}"
+        if guard.error_category(error) == "credential-detected":
+            metadata = guard.error_metadata(error)
+            sources = ",".join(metadata["sources"]) or "unattributed"
+            message += f"; sources={sources}; stream={metadata['stream']}; command-status={metadata['command_status']}"
+        message += "; no public output prepared\n"
+        try:
+            guard.inspect_bytes(message)
+        except guard.GuardError:
+            message = ""
+        parser.exit(1, message)
+
+
+if __name__ == "__main__":
+    main()

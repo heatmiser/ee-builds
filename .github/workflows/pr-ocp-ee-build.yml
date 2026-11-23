@@ -6,7 +6,11 @@ on:
     branches: [main]
     types: [opened, reopened, synchronize]
     paths:
+      - ".github/scripts/ci_secrets.py"
+      - "tests/test_ci_secrets.py"
       - ".github/scripts/ocp_ee.py"
+      - ".github/scripts/ee_projects.py"
+      - ".github/ee-projects.json"
       - ".github/ocp-ee-streams.json"
       - ".github/workflows/pr-ocp-ee-build.yml"
       - "dcm-ocp-ee-*/**"
@@ -31,47 +35,84 @@ jobs:
       matrix: ${{ steps.prepare.outputs.matrix }}
       plan_artifact: ${{ steps.prepare.outputs.plan_artifact }}
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-pr-ocp-ee-build-prepare.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
+      - name: Validate PR EE eligibility before registry access
+        run: python3 .github/scripts/ocp_ee.py check-pr
+
       - name: Log in to Quay for the published base
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Log in to GHCR for published bases
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry ghcr.io
 
       - name: Resolve published base once and select exact releases
         id: prepare
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
         run: |
           python3 .github/scripts/ocp_ee.py prepare-pr > "$RUNNER_TEMP/ocp-ee-pr-plan.json"
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          import ci_secrets
           plan = json.loads((Path(os.environ["RUNNER_TEMP"]) / "ocp-ee-pr-plan.json").read_text())
+          ci_secrets.inspect_bytes(json.dumps(plan))
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("matrix=" + json.dumps(plan["matrix"]) + "\n")
               output.write("plan_artifact=ocp-ee-pr-plan-" + os.environ["GITHUB_RUN_ID"]
                            + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "\n")
           PY
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        if: success()
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-pr-plan.json"
+
       - name: Preserve qualification plan
-        if: always()
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-pr-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ocp-ee-pr-plan.json
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   build:
     # Qualify against the published base only after same-repository preparation.
@@ -81,17 +122,27 @@ jobs:
     environment: test
     permissions:
       contents: read
-      packages: write
+      packages: read
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-pr-ocp-ee-build-build.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out PR source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
+
+      - name: Validate selected EE eligibility before registry access
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+        run: python3 .github/scripts/ocp_ee.py matrix --versions "$OCP_RELEASE"
 
       - name: Download prepared qualification plan
         uses: actions/download-artifact@v4
@@ -110,24 +161,44 @@ jobs:
 
       - name: Log in to Quay for the published base
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Log in to Red Hat registry
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry registry.redhat.io
 
       - name: Log in to GHCR
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry ghcr.io
 
       - name: Build and verify PR image against the pinned base
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           OCP_RELEASE: ${{ matrix.release }}
           OCP_PLAN: ${{ runner.temp }}/ocp-ee-plan/ocp-ee-pr-plan.json
           SOURCE_COMMIT: ${{ github.event.pull_request.head.sha }}
@@ -140,6 +211,9 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          import ci_secrets
           try:
               plan = json.loads(Path(os.environ["OCP_PLAN"]).read_text())
               base = plan["base"]
@@ -160,19 +234,43 @@ jobs:
             --output "$RUNNER_TEMP/ocp-ee-pr-$OCP_RELEASE"
 
       - name: Publish verified PR image to GHCR
+        if: ${{ false }} # Held pending credential containment and qualification.
         env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
           OCP_RELEASE: ${{ matrix.release }}
           OCP_REGISTRY: ghcr.io/${{ github.repository_owner }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
             --receipt "$RUNNER_TEMP/ocp-ee-pr-$OCP_RELEASE/receipt.json" --registry "$OCP_REGISTRY"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        if: success()
+        env:
+          CI_SECRET_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_SA_PASSWORD: ${{ secrets.REDHAT_SA_PASSWORD }}
+          CI_SECRET_REDHAT_SA_USERNAME: ${{ secrets.REDHAT_SA_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json"
+
       - name: Preserve PR qualification evidence
-        if: always()
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-pr-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ocp-ee-pr-${{ matrix.release }}/receipt.json
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
+
 ...

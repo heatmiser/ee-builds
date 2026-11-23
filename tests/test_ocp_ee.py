@@ -29,6 +29,20 @@ IMAGE_ID = "c" * 64
 PAYLOAD = "quay.io/openshift-release-dev/ocp-release@sha256:" + "d" * 64
 
 
+def setUpModule():
+    global image_guard_patch, environment_patch
+    environment_patch = patch.dict(os.environ)
+    environment_patch.start()
+    os.environ.pop("REGISTRY_AUTH_FILE", None)
+    image_guard_patch = patch.object(EE.ci_secrets, "inspect_image", return_value="sha256:" + IMAGE_ID)
+    image_guard_patch.start()
+
+
+def tearDownModule():
+    image_guard_patch.stop()
+    environment_patch.stop()
+
+
 def installer(version="4.22.22"):
     return f"openshift-install {version}\nrelease image {PAYLOAD}\nrelease architecture amd64\n"
 
@@ -65,6 +79,10 @@ class Runner:
         self.commands.append(argv)
         if argv == ["git", "rev-parse", "HEAD"]:
             return COMMIT + "\n"
+        if argv[0] == "ansible-builder":
+            context = Path(argv[argv.index("--context") + 1])
+            context.mkdir(exist_ok=True)
+            (context / "Containerfile").write_text("FROM scratch\n")
         if argv[0] == "ansible-builder" or argv[:2] in (["podman", "pull"], ["podman", "build"]):
             return ""
         if "{{json .RepoDigests}}" in argv:
@@ -215,85 +233,103 @@ class VersionSelectionTests(unittest.TestCase):
 
 
 class RegistryLoginTests(unittest.TestCase):
-    def test_cli_login_suppresses_synthetic_secrets_on_success_and_failure(self):
+    def test_cli_login_writes_only_private_authfile_without_subprocess(self):
         username, password = "synthetic-login-user", "synthetic-login-password:/+$"
         encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-        messages = (
-            f"username={username} password={password}",
-            f"Authorization: Basic {encoded}\nAuthorization: Bearer {password}",
-            f"https://{username}:{password}@registry.invalid/\n::error::{encoded}",
-            json.dumps({"auth": encoded, "identitytoken": password}),
-            f"{username}\n{password}\n{encoded}\r\n\x1b[31m{password}\x1b[0m",
-        )
-        for registry in ("quay.io", "ghcr.io", "registry.redhat.io"):
-            for success in (True, False):
-                for index, message in enumerate(messages):
-                    with self.subTest(registry=registry, success=success, payload=index):
-                        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            home.mkdir()
+            auth = root / "ee-auth-registry-tests.json"
+            environment = {"RUNNER_TEMP": directory, "REGISTRY_AUTH_FILE": str(auth),
+                           "HOME": str(home), "REGISTRY_USERNAME": username, "REGISTRY_PASSWORD": password}
+            for registry in EE.LOGIN_REGISTRIES:
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(registry=registry), patch.dict(os.environ, environment, clear=True), \
+                        patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", registry]), \
+                        patch.object(EE.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    EE.main()
+                run.assert_not_called()
+                record = json.loads(auth.read_text())
+                self.assertEqual(record["auths"][registry], {"auth": encoded})
+                self.assertEqual(auth.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(stdout.getvalue(), f"Registry login succeeded for {registry}\n")
+                self.assertEqual(stderr.getvalue(), "")
+                for secret in (username, password, encoded):
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(set(record["auths"]), set(EE.LOGIN_REGISTRIES))
+            self.assertEqual(list(home.iterdir()), [])
+            self.assertEqual(set(root.iterdir()), {home, auth})
 
-                        def run(argv, **kwargs):
-                            self.assertEqual(argv, ["podman", "login", "--username", username,
-                                                    "--password-stdin", registry])
-                            self.assertNotIn(password, argv)
-                            self.assertEqual(kwargs["input"], password + "\n")
-                            self.assertTrue(kwargs["capture_output"])
-                            self.assertTrue(kwargs["check"])
-                            self.assertEqual(kwargs["timeout"], 120)
-                            self.assertNotIn("REGISTRY_USERNAME", kwargs["env"])
-                            self.assertNotIn("REGISTRY_PASSWORD", kwargs["env"])
-                            if not success:
-                                raise subprocess.CalledProcessError(125, argv, output=message, stderr=message)
-                            return subprocess.CompletedProcess(argv, 0, stdout=message, stderr=message)
-
-                        with patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
-                                patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", registry]), \
-                                patch.object(EE.subprocess, "run", side_effect=run), \
-                                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                            if success:
-                                EE.main()
-                            else:
-                                with self.assertRaises(SystemExit) as error:
-                                    EE.main()
-                                self.assertEqual(error.exception.code, 1)
-                        if success:
-                            self.assertEqual(stdout.getvalue(), f"Registry login succeeded for {registry}\n")
-                            self.assertEqual(stderr.getvalue(), "")
-                        else:
-                            self.assertEqual(stdout.getvalue(), "")
-                            self.assertEqual(stderr.getvalue(),
-                                             f"ERROR: OCP EE registry-login failed: Registry login failed for {registry}; "
-                                             "command output suppressed; preserve build evidence.\n")
-                        for secret in (username, password, encoded):
-                            self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+    def test_missing_or_unsafe_authfiles_never_fall_back_to_subprocess(self):
+        username, password = "synthetic-login-user", "synthetic-login-password:/+$"
+        encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "untouched.json"
+            target.write_text("untouched")
+            link = root / "ee-auth-link.json"
+            link.symlink_to(target)
+            cases = ({}, {"REGISTRY_AUTH_FILE": ""},
+                     {"REGISTRY_AUTH_FILE": "ee-auth-relative.json"},
+                     {"REGISTRY_AUTH_FILE": str(root.parent / "ee-auth-outside.json")},
+                     {"REGISTRY_AUTH_FILE": str(root / "wrong-prefix.json")},
+                     {"REGISTRY_AUTH_FILE": str(link)},
+                     {"REGISTRY_AUTH_FILE": str(root / "ee-auth-valid.json"), "RUNNER_TEMP": ""})
+            for overrides in cases:
+                environment = {"RUNNER_TEMP": directory, "REGISTRY_USERNAME": username,
+                               "REGISTRY_PASSWORD": password, **overrides}
+                if overrides.get("RUNNER_TEMP") == "":
+                    del environment["RUNNER_TEMP"]
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(overrides=overrides), patch.dict(os.environ, environment, clear=True), \
+                        patch("sys.argv", ["ocp_ee.py", "registry-login", "--registry", "quay.io"]), \
+                        patch.object(EE.subprocess, "run") as run, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as caught:
+                        EE.main()
+                self.assertEqual(caught.exception.code, 1)
+                run.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                expected = ("Registry authentication file required" if not overrides.get("REGISTRY_AUTH_FILE")
+                            else "Registry login failed for quay.io; command output suppressed")
+                self.assertEqual(stderr.getvalue(), f"ERROR: OCP EE registry-login failed: {expected}; "
+                                 "preserve build evidence.\n")
+                for secret in (username, password, encoded):
+                    self.assertNotIn(secret, stdout.getvalue() + stderr.getvalue())
+            self.assertEqual(target.read_text(), "untouched")
+            self.assertEqual(set(root.iterdir()), {target, link})
 
     def test_login_runtime_exceptions_do_not_expose_credentials(self):
         secret = "synthetic-exception-secret"
-        errors = (OSError(secret), ValueError(secret),
-                  subprocess.TimeoutExpired(["podman", "login", secret], 120, output=secret, stderr=secret))
-        for error in errors:
+        for error in (OSError(secret), ValueError(secret), KeyError(secret)):
             with self.subTest(error=type(error).__name__), \
-                    patch.dict(os.environ, REGISTRY_USERNAME="synthetic-user", REGISTRY_PASSWORD=secret), \
-                    patch.object(EE.subprocess, "run", side_effect=error), \
+                    patch.dict(os.environ, REGISTRY_USERNAME="synthetic-user", REGISTRY_PASSWORD=secret,
+                               REGISTRY_AUTH_FILE="/unused/ee-auth-tests.json"), \
+                    patch.object(EE.ci_secrets, "login", side_effect=error), \
+                    patch.object(EE.subprocess, "run") as run, \
                     self.assertRaises(ValueError) as failure:
                 EE.registry_login("quay.io")
+            run.assert_not_called()
             self.assertEqual(str(failure.exception),
                              "Registry login failed for quay.io; command output suppressed")
             self.assertIsNone(failure.exception.__cause__)
             self.assertTrue(failure.exception.__suppress_context__)
 
-    def test_missing_credentials_and_unapproved_registries_fail_before_podman(self):
+    def test_missing_credentials_and_unapproved_registries_fail_before_authfile_write(self):
         for username, password in (("", ""), ("user", ""), ("", "password")):
             with self.subTest(username_present=bool(username), password_present=bool(password)), \
                     patch.dict(os.environ, REGISTRY_USERNAME=username, REGISTRY_PASSWORD=password), \
-                    patch.object(EE.subprocess, "run") as run, \
+                    patch.object(EE.ci_secrets, "login") as login, \
                     self.assertRaisesRegex(ValueError, "Registry login credentials missing"):
                 EE.registry_login("quay.io")
-            run.assert_not_called()
-        with patch.object(EE.subprocess, "run") as run, \
+            login.assert_not_called()
+        with patch.object(EE.ci_secrets, "login") as login, \
                 self.assertRaisesRegex(ValueError, "Unsupported registry login target"):
             username, password = "user", "password"
             EE.registry_login(f"https://{username}:{password}@unknown.invalid")
-        run.assert_not_called()
+        login.assert_not_called()
 
 
 class PublicOutputTests(unittest.TestCase):
@@ -790,6 +826,10 @@ class BuildAndPublishTests(unittest.TestCase):
         config["streams"] = {"5.0": {"definition": definition, "automatic": False}}
         config_path = workspace / "streams.json"
         config_path.write_text(json.dumps(config))
+        catalog = json.loads((ROOT / ".github/ee-projects.json").read_text())
+        catalog["projects"] = {definition: catalog["projects"]["dcm-ocp-ee-4.22"]}
+        (workspace / ".github").mkdir()
+        (workspace / ".github/ee-projects.json").write_text(json.dumps(catalog))
         with patch.object(EE, "ROOT", workspace), patch.object(EE, "CONFIG", config_path):
             receipt = EE.build("5.0.1", BASE, COMMIT, "123-1", self.output,
                                run=Runner(version="5.0.1", client="5.0.1"), opener=Mirror(version="5.0.1"))
@@ -939,6 +979,61 @@ class BuildAndPublishTests(unittest.TestCase):
                     self.assertTrue((output / "context/_build/ocp-release" / name).is_file())
 
 
+class ProjectEligibilityTests(unittest.TestCase):
+    def disabled(self, *names):
+        catalog = EE.load_catalog(ROOT)
+        for name in names:
+            catalog[name]["status"] = "example"
+        return patch.object(EE, "load_catalog", return_value=catalog)
+
+    def test_automatic_matrix_filters_legacy_and_versioned_examples(self):
+        with self.disabled("dcm-ocp-ee-4.16", "dcm-ocp-ee-4.22"), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            matrix = EE.automation_matrix()["include"]
+        self.assertNotIn("4.16", [e["ocp_version"] for e in matrix])
+        self.assertNotIn("4.22", [e["ocp_version"] for e in matrix])
+        self.assertNotIn("5.0", [e["ocp_version"] for e in matrix])
+        self.assertIn("Skip example-only dependent EE", stderr.getvalue())
+
+    def test_shared_definition_blocks_both_streams_and_pr_preparation(self):
+        runner = Runner()
+        with self.disabled("dcm-ocp-ee-4.22"):
+            for version in ("4.22.22", "5.0.1"):
+                with self.subTest(version=version), self.assertRaisesRegex(ValueError, "example-only"):
+                    EE.release_matrix(version)
+            with self.assertRaisesRegex(ValueError, "example-only"):
+                EE.prepare_pr(runner)
+        self.assertEqual(runner.commands, [])
+
+    def test_disabled_direct_build_fails_before_mirror_commands_or_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for selection in ("4.22.22", "stable-4.22"):
+                runner, mirror = Runner(), Mirror()
+                output = Path(directory) / selection
+                with self.disabled("dcm-ocp-ee-4.22"), self.assertRaisesRegex(ValueError, "example-only"):
+                    EE.build(selection, BASE, COMMIT, "123-1", output, run=runner, opener=mirror)
+                self.assertEqual(runner.commands, [])
+                self.assertEqual(mirror.urls, [])
+                self.assertFalse(output.exists())
+
+    def test_disabling_project_prevents_publication_of_a_retained_verified_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = EE.build("4.22.22", BASE, COMMIT, "123-1", Path(directory) / "build",
+                               run=Runner(), opener=Mirror())
+            original = receipt.read_bytes()
+            runner = Runner()
+            with self.disabled("dcm-ocp-ee-4.22"), self.assertRaisesRegex(ValueError, "example-only"):
+                EE.publish(receipt, "quay.io/s4v0", runner)
+            self.assertEqual(runner.commands, [])
+            self.assertEqual(receipt.read_bytes(), original)
+
+    def test_unknown_definition_cannot_enter_automatic_matrix(self):
+        catalog = EE.load_catalog(ROOT)
+        del catalog["dcm-ocp-ee-4.16"]
+        with patch.object(EE, "load_catalog", return_value=catalog), self.assertRaises(ValueError):
+            EE.automation_matrix()
+
+
 class WorkflowTests(unittest.TestCase):
     def test_openshift_artifacts_allow_only_receipts_and_plan_with_bounded_retention(self):
         expected = {
@@ -982,7 +1077,8 @@ class WorkflowTests(unittest.TestCase):
         for step in logins:
             registry = step["run"].rsplit(" ", 1)[1]
             self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
-            self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+            self.assertEqual({key: step["env"][key] for key in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD")},
+                             dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
             self.assertNotIn("uses", step)
         self.assertEqual({step["run"].rsplit(" ", 1)[1] for step in logins}, set(expected))
         self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
@@ -1024,7 +1120,8 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual([step["run"].rsplit(" ", 1)[1] for step in logins], registries)
             for registry, step in zip(registries, logins):
                 self.assertEqual(step["run"], f"python3 .github/scripts/ocp_ee.py registry-login --registry {registry}")
-                self.assertEqual(step["env"], dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
+                self.assertEqual({key: step["env"][key] for key in ("REGISTRY_USERNAME", "REGISTRY_PASSWORD")},
+                             dict(zip(("REGISTRY_USERNAME", "REGISTRY_PASSWORD"), expected[registry])))
                 self.assertNotIn("uses", step)
             self.assertFalse(any(step.get("uses", "").startswith("redhat-actions/podman-login") for step in steps))
 
@@ -1033,7 +1130,7 @@ class WorkflowTests(unittest.TestCase):
                              Loader=yaml.BaseLoader)
         prepare, build = workflow["jobs"]["prepare"], workflow["jobs"]["build"]
         prepare_command = next(step for step in prepare["steps"] if step.get("id") == "prepare")
-        self.assertEqual(prepare_command["env"], {"VERSIONS": "${{ inputs.versions }}",
+        self.assertEqual({key: prepare_command["env"][key] for key in ("VERSIONS", "BASE_IMAGE")}, {"VERSIONS": "${{ inputs.versions }}",
                                                   "BASE_IMAGE": "${{ inputs.base_image }}"})
         upload = next(step for step in prepare["steps"] if step["name"] == "Preserve release plan")
         self.assertEqual(upload["with"], {
@@ -1142,8 +1239,10 @@ else:
             workflow = yaml.safe_load((ROOT / ".github/workflows" / filename).read_text())
             steps = workflow["jobs"]["build-ocp-ees"]["steps"]
             for step in steps:
-                if step["name"] in ("Build image", "Push To GHCR", "Push To quay.io"):
+                if step["name"] == "Build image":
                     self.assertEqual(step["if"], "${{ !matrix.versioned }}")
+                elif step["name"] in ("Push To GHCR", "Push To quay.io"):
+                    self.assertEqual(step["if"], "${{ false }}")
             special = next(step for step in steps if step["name"] == "Build and verify configured stable OpenShift release")
             self.assertEqual(special["if"], "matrix.versioned")
             self.assertIn('--release "stable-$OCP_STREAM"', special["run"])
@@ -1158,7 +1257,7 @@ else:
         workflow = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
 
-    def test_pr_qualification_is_independent_and_publishes_only_to_ghcr(self):
+    def test_pr_qualification_is_independent_with_ghcr_publication_held(self):
         path = ROOT / ".github/workflows/pr-ocp-ee-build.yml"
         workflow = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
@@ -1166,7 +1265,7 @@ else:
         self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
         self.assertNotIn("needs", prepare)
         self.assertEqual(build["needs"], "prepare")
-        self.assertEqual(build["permissions"]["packages"], "write")
+        self.assertEqual(build["permissions"]["packages"], "read")
         self.assertEqual(build["strategy"]["matrix"], "${{ fromJson(needs.prepare.outputs.matrix) }}")
         self.assertTrue(any("prepare-pr" in step.get("run", "") for step in prepare["steps"]))
         for job in (prepare, build):
@@ -1189,6 +1288,7 @@ else:
         self.assertEqual(command["env"]["SOURCE_COMMIT"], "${{ github.event.pull_request.head.sha }}")
         self.assertIn('--pr "$PR_NUMBER"', command["run"])
         publish = next(step for step in build["steps"] if step["name"] == "Publish verified PR image to GHCR")
+        self.assertEqual(publish["if"], "${{ false }}")
         self.assertEqual(publish["env"]["OCP_REGISTRY"], "ghcr.io/${{ github.repository_owner }}")
         self.assertIn(".github/ocp-ee-streams.json", workflow["on"]["pull_request"]["paths"])
         validation = yaml.load((ROOT / ".github/workflows/test-ocp-ee.yml").read_text(), Loader=yaml.BaseLoader)
@@ -1263,7 +1363,10 @@ else:
         self.assertEqual(build["needs"], "prepare")
         self.assertEqual(prepare["if"], "github.event.pull_request.head.repo.full_name == github.repository")
         images = yaml.load((ROOT / ".github/workflows/pr-image-build.yml").read_text(), Loader=yaml.BaseLoader)
-        self.assertEqual(images["jobs"]["build-image"]["if"], "${{ false }}")
+        self.assertIn("outputs.length != '0'", images["jobs"]["build-image"]["if"])
+        publication = next(step for step in images["jobs"]["build-image"]["steps"]
+                           if step["name"] == "Publish inspected image after hosted qualification")
+        self.assertEqual(publication["if"], "${{ false }}")
         self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
         self.assertEqual(set(workflow["jobs"]), {"prepare", "build"})
         for step in prepare["steps"]:

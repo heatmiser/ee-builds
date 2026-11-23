@@ -4,6 +4,10 @@ import os
 import sys
 import logging
 import argparse
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from ee_projects import CatalogError, is_active, load_catalog
 
 def setup_logger(level):
     """Set up the logger with specified logging level."""
@@ -58,6 +62,8 @@ def main():
     # by the build-ocp-ees job after build-ee completes. Exclude from this matrix.
     DEPENDENT_EE_PREFIX = "dcm-ocp-ee-"
     args = parse_arguments()
+    workspace = Path(os.environ.get('GITHUB_WORKSPACE', Path(__file__).resolve().parents[2]))
+    catalog = load_catalog(workspace)
     log_level = logging.DEBUG if args.log_level == 'DEBUG' else logging.INFO
     logger = setup_logger(log_level)
 
@@ -76,7 +82,6 @@ def main():
 
     for file in changed_files:
         current_dir = os.path.dirname(file)
-        workspace = os.getenv('GITHUB_WORKSPACE', '')
 
         # Walk up the directory tree
         while current_dir != "":
@@ -93,11 +98,20 @@ def main():
             if parent == current_dir: break
             current_dir = parent
 
-    matrix = {'include': [{'ee': dir_name} for dir_name in dirs if not dir_name.startswith(DEPENDENT_EE_PREFIX)]}
+    eligible = []
+    for dir_name in sorted(dirs):
+        if not is_active(dir_name, catalog):
+            logger.info('Skip example-only EE: %s', dir_name)
+        elif not dir_name.startswith(DEPENDENT_EE_PREFIX):
+            eligible.append({'ee': dir_name})
+    matrix = {'include': eligible}
     logger.info(f"Generated matrix: {json.dumps(matrix, indent=4)}")
 
     with open(args.output_path, 'w') as file:
         file.write(json.dumps(matrix))
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CatalogError as error:
+        sys.exit('ERROR: ' + str(error))

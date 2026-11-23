@@ -26,8 +26,15 @@ jobs:
       matrix: ${{ steps.prepare.outputs.matrix }}
       plan_artifact: ${{ steps.prepare.outputs.plan_artifact }}
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-build-versioned-ocp-ee-prepare.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
 
       - name: Validate exact releases
         env:
@@ -36,6 +43,8 @@ jobs:
 
       - name: Log in to Quay
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
@@ -43,6 +52,8 @@ jobs:
       - name: Resolve one base digest and prepare matrix
         id: prepare
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           VERSIONS: ${{ inputs.versions }}
           BASE_IMAGE: ${{ inputs.base_image }}
         run: |
@@ -69,20 +80,39 @@ jobs:
                       raise ValueError
           except (ValueError, KeyError, TypeError, OSError):
               raise SystemExit("Invalid release preparation; original content suppressed.") from None
-          (parent / "ocp-ee-release-plan.json").write_text(json.dumps({"matrix": matrix, "base": base}) + "\n")
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          import ci_secrets
+          content = json.dumps({"matrix": matrix, "base": base}) + "\n"
+          ci_secrets.inspect_bytes(content)
+          (parent / "ocp-ee-release-plan.json").write_text(content)
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write("matrix=" + json.dumps(matrix) + "\n")
               output.write("plan_artifact=ocp-ee-release-plan-" + os.environ["GITHUB_RUN_ID"]
                            + "-" + os.environ["GITHUB_RUN_ATTEMPT"] + "\n")
           PY
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-release-plan.json"
+
       - name: Preserve release plan
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-release-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ocp-ee-release-plan.json
           retention-days: 30
           if-no-files-found: error
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
 
   build:
     needs: prepare
@@ -96,8 +126,20 @@ jobs:
       max-parallel: 1
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
     steps:
+      - name: Initialize job registry authentication
+        shell: bash
+        run: |
+          printf 'REGISTRY_AUTH_FILE=%s/ee-auth-build-versioned-ocp-ee-build.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Validate selected EE eligibility before registry access
+        env:
+          OCP_RELEASE: ${{ matrix.release }}
+        run: python3 .github/scripts/ocp_ee.py matrix --versions "$OCP_RELEASE"
 
       - name: Download prepared release plan
         uses: actions/download-artifact@v4
@@ -111,18 +153,30 @@ jobs:
 
       - name: Log in to Quay
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.QUAY_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry quay.io
 
       - name: Log in to Red Hat registry
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           REGISTRY_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           REGISTRY_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
         run: python3 .github/scripts/ocp_ee.py registry-login --registry registry.redhat.io
 
       - name: Build and verify selected release
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           OCP_RELEASE: ${{ matrix.release }}
           OCP_PLAN: ${{ runner.temp }}/ocp-ee-release-plan/ocp-ee-release-plan.json
           SOURCE_COMMIT: ${{ github.sha }}
@@ -134,6 +188,9 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import sys
+          sys.path.insert(0, ".github/scripts")
+          import ci_secrets
           try:
               plan = json.loads(Path(os.environ["OCP_PLAN"]).read_text())
               base = plan["base"]
@@ -154,19 +211,41 @@ jobs:
             --output "$RUNNER_TEMP/ocp-ee-$OCP_RELEASE"
 
       - name: Publish patch and build tags
+        if: ${{ false }} # Held pending credential containment and qualification.
         env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
           OCP_RELEASE: ${{ matrix.release }}
           OCP_REGISTRY: quay.io/${{ secrets.QUAY_USERNAME }}
         run: |
           python3 .github/scripts/ocp_ee.py publish \
             --receipt "$RUNNER_TEMP/ocp-ee-$OCP_RELEASE/receipt.json" --registry "$OCP_REGISTRY"
 
+      - name: Check exact public files for credential values
+        id: secret_files_0
+        if: success()
+        env:
+          CI_SECRET_QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
+          CI_SECRET_QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          CI_SECRET_REDHAT_PASSWORD: ${{ secrets.REDHAT_PASSWORD }}
+          CI_SECRET_REDHAT_USERNAME: ${{ secrets.REDHAT_USERNAME }}
+        run: |
+          python3 .github/scripts/ci_secrets.py files \
+            "${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json"
+
       - name: Preserve build receipt
-        if: always()
+        if: success() && steps.secret_files_0.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: ocp-ee-${{ matrix.release }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ocp-ee-${{ matrix.release }}/receipt.json
           retention-days: 30
           if-no-files-found: ignore
+
+      - name: Remove job registry authentication
+        if: always()
+        run: python3 .github/scripts/ci_secrets.py cleanup-auth
+
 ...

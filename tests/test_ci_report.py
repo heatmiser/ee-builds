@@ -40,10 +40,64 @@ class ReportTests(unittest.TestCase):
         (definition / 'image.yaml').write_text('cli_binary: example\n')
         self.output = self.work / 'results'
 
-    def generate(self, kind='image', run=None, output=None):
+    def generate(self, kind='image', run=None, output=None, **options):
         with patch.object(REPORT, 'ROOT', self.work):
             return REPORT.generate(kind, 'example-image:pr-64-test', 'ghcr.io/heatmiser/example-image:pr-64-test',
-                                   COMMIT, output or self.output, run=run)
+                                   COMMIT, output or self.output, run=run, **options)
+
+    def test_explicit_runtime_options_precede_entrypoint_image_and_command(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(self.generate(run=run, network='none',
+                                      container_env={'AGY_HEADLESS': '1', 'AGY_TRUST_WORKSPACE': 'true'}), 0)
+        prefix = ['podman', 'run', '--rm', '--pull=never', '--network=none',
+                  '--env', 'AGY_HEADLESS=1', '--env', 'AGY_TRUST_WORKSPACE=true']
+        self.assertEqual(calls, [prefix + ['--entrypoint', 'example', 'example-image:pr-64-test', '--version'],
+                                 prefix + ['--entrypoint', 'sh', 'example-image:pr-64-test', '-c', REPORT.TOOL_CHECK]])
+
+    def test_default_ee_runtime_commands_remain_unchanged(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(self.generate(kind='ee', run=run), 0)
+        base = ['podman', 'run', '--rm', '--pull=never', 'example-image:pr-64-test']
+        self.assertEqual(calls, [base + ['ansible-galaxy', 'collection', 'list'], base + ['ansible', '--version']])
+
+    def test_dotted_ee_name_runs_checks_and_writes_matching_report(self):
+        local_image = 'ocp-satellite-ee-4.22:pr-68-d12996d'
+        reference = 'ghcr.io/heatmiser/' + local_image
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0)
+
+        self.assertEqual(REPORT.generate('ee', local_image, reference, COMMIT, self.output, run=run), 0)
+        base = ['podman', 'run', '--rm', '--pull=never', local_image]
+        self.assertEqual(calls, [base + ['ansible-galaxy', 'collection', 'list'],
+                                 base + ['ansible', '--version']])
+        report = (self.output / 'commands-ocp-satellite-ee-4.22.txt').read_text()
+        self.assertIn(reference, report)
+        self.assertIn('- ansible-collections: PASS', report)
+        self.assertIn('- ansible-version: PASS', report)
+
+    def test_invalid_runtime_options_cannot_execute_or_create_reports(self):
+        cases = ({'network': 'host'}, {'container_env': ['AGY_HEADLESS=1']},
+                 {'container_env': {'--privileged': 'true'}}, {'container_env': {'TOKEN': None}},
+                 {'container_env': {'TOKEN': 'bad\nvalue'}}, {'container_env': {'TOKEN': 'bad\x00value'}})
+        for options in cases:
+            with self.subTest(options=options), patch.object(REPORT.subprocess, 'run') as run, \
+                    self.assertRaises(ValueError):
+                self.generate(**options)
+            run.assert_not_called()
+            self.assertFalse(self.output.exists())
 
     def test_synthetic_stdout_and_stderr_never_reach_success_or_failure_reports(self):
         for kind in ('ee', 'image'):
@@ -96,6 +150,8 @@ class ReportTests(unittest.TestCase):
     def test_invalid_metadata_stops_before_commands_or_report_creation(self):
         valid = ['image', 'example-image:tag', 'quay.io/s4v0/example-image:tag', COMMIT]
         invalid = ((0, SECRET), (1, '../example-image:tag'), (1, 'k8s-launch-kit:tag'),
+                   (1, '.example-image:tag'), (1, 'example.image/../other:tag'),
+                   (1, 'example.image:tag;id'), (1, 'example.image:tag\n'),
                    (1, 'example-image:tag\n' + SECRET), (2, 'https://registry.invalid/?auth=' + SECRET),
                    (2, 'quay.io/s4v0/other-image:tag'), (2, 'quay.io/s4v0/example-image:other-tag'),
                    (2, valid[2] + '\n::error::' + SECRET), (3, SECRET))
@@ -161,32 +217,22 @@ class WorkflowReportTests(unittest.TestCase):
     def workflow(self, name):
         return yaml.load((ROOT / '.github/workflows' / name).read_text(), Loader=yaml.BaseLoader)
 
-    def test_all_four_workflows_use_bounded_reports_and_explicit_uploads(self):
-        for name in ('pr-ee-build.yml', 'push-ee-build.yml', 'pr-image-build.yml', 'push-image-build.yml'):
+    def test_ee_workflows_use_bounded_reports_and_explicit_uploads(self):
+        for name in ('pr-ee-build.yml', 'push-ee-build.yml'):
             with self.subTest(workflow=name):
-                workflow = self.workflow(name)
-                kind = 'ee' if '-ee-' in name else 'image'
-                steps = workflow['jobs']['build-ee' if kind == 'ee' else 'build-image']['steps']
+                steps = self.workflow(name)['jobs']['build-ee']['steps']
                 build = next(s for s in steps if s['name'] == 'Build image and create artifact')
                 self.assertNotIn('COMMANDS_FILE', build['run'])
                 self.assertNotIn('podman run', build['run'])
                 report = next(s for s in steps if s['name'] == 'Generate bounded build report')
-                self.assertIn(f'ci_report.py --kind {kind}', report['run'])
+                self.assertIn('ci_report.py --kind ee', report['run'])
                 self.assertNotIn('${{', report['run'])
                 self.assertIn('--reference "$REPORT_REFERENCE"', report['run'])
-                if kind == 'image':
-                    self.assertEqual(report['if'], "matrix.image != 'k8s-launch-kit'")
                 upload = next(s for s in steps if s['name'] == 'Upload build artifact')
-                self.assertNotIn('if', upload)  # failed checks cannot publish a report as successful evidence
+                self.assertIn("steps.secret_files_0.outcome == 'success'", upload['if'])
                 self.assertEqual(upload['with']['retention-days'], '7' if name.startswith('pr-') else '30')
-                path = upload['with']['path']
-                self.assertNotIn('*', path)
-                self.assertNotIn('private-logs', path)
-                if kind == 'ee':
-                    self.assertEqual(path, '${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt')
-                else:
-                    self.assertIn("'tmp/l8k-ci/public/commands-k8s-launch-kit.txt'", path)
-                    self.assertIn("format('{0}/ci-report-{1}/commands-{1}.txt', runner.temp, matrix.image)", path)
+                self.assertEqual(upload['with']['path'],
+                                 '${{ runner.temp }}/ci-report-${{ matrix.ee }}/commands-${{ matrix.ee }}.txt')
 
     def test_pr_comments_contain_only_fixed_workflow_link_even_with_secret_artifacts_present(self):
         self.assertIsNotNone(shutil.which('node'), 'Node is required to execute the comment-script contract')
