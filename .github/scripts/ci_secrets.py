@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -290,6 +291,41 @@ def login(registry):
         json.dump(record, stream)
 
 
+def push_image(image, destination):
+    """Push inspected immutable bytes; retain only a checked private receipt."""
+    inspect_bytes(destination)
+    if not re.fullmatch(r"(?:ghcr\.io|quay\.io)/[a-z0-9_-]+/[a-z0-9_.-]+:[A-Za-z0-9_.-]+", destination):
+        raise GuardError("Invalid publication reference")
+    auth = auth_path()
+    identity = inspect_image(image)
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", identity):
+        raise GuardError("Invalid inspected image identity")
+    # Keep completed receipts between calls. A later failed tag does not erase
+    # earlier success, and no receipt is uploaded or printed by this helper.
+    work = Path(tempfile.mkdtemp(prefix="ee-publication-", dir=Path(os.environ["RUNNER_TEMP"]).resolve()))
+    digestfile = work / "manifest.digest"
+    captured(["podman", "push", "--authfile", str(auth), "--digestfile", str(digestfile),
+              identity, "docker://" + destination], capture_result=False)
+    fd = os.open(digestfile, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 128:
+            raise GuardError("Invalid publication digest evidence")
+        os.fchmod(stream.fileno(), 0o600)
+        raw = stream.read(129)
+    inspect_bytes(raw)
+    digest = raw.decode("ascii").strip()
+    if len(raw) > 128 or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+        raise GuardError("Invalid publication manifest digest")
+    record = {"schema_version": 1, "image_id": identity, "destination": destination,
+              "manifest_digest": digest}
+    content = json.dumps(record, sort_keys=True, indent=2) + "\n"
+    inspect_bytes(content)
+    with open(work / "receipt.json", "x", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
+        stream.write(content)
+    return record
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -316,11 +352,7 @@ def main():
         elif args.command == "cleanup-auth":
             auth_path().unlink(missing_ok=True)
         elif args.command == "push":
-            inspect_bytes(args.destination)
-            if not re.fullmatch(r"(?:ghcr\.io|quay\.io)/[a-z0-9_-]+/[a-z0-9_.-]+:[A-Za-z0-9_.-]+", args.destination):
-                raise GuardError("Invalid publication reference")
-            identity = inspect_image(args.image)
-            captured(["podman", "push", "--authfile", str(auth_path()), identity, "docker://" + args.destination], capture_result=False)
+            push_image(args.image, args.destination)
         else:
             token = value("REFRESH_TOKEN")
             if not token:

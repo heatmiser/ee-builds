@@ -25,6 +25,91 @@ def workflow(name):
 
 
 class CredentialContainmentWorkflowTests(unittest.TestCase):
+    def production_fixture(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        env = {"PATH": os.environ["PATH"], "HOME": str(root), "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_AUTHOR_NAME": "Synthetic Test",
+               "GIT_AUTHOR_EMAIL": "test@example.invalid", "GIT_COMMITTER_NAME": "Synthetic Test",
+               "GIT_COMMITTER_EMAIL": "test@example.invalid"}
+
+        def git(*args):
+            return subprocess.check_output(['git', *args], cwd=root, env=env, stderr=subprocess.DEVNULL).decode().strip()
+
+        git('init', '-b', 'main')
+        commits = []
+        for number in range(3):
+            (root / 'fixture').write_text(str(number))
+            git('add', 'fixture')
+            git('-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', 'commit', '-m', 'synthetic')
+            commits.append(git('rev-parse', 'HEAD'))
+        script = root / '.github/workflows/generate_matrix.py'
+        script.parent.mkdir(parents=True)
+        script.write_text('import json, sys\nfrom pathlib import Path\n'
+                          'Path("matrix-argv.json").write_text(json.dumps(sys.argv[1:]))\n')
+        return root, env, commits
+
+    def test_production_source_is_main_event_commit_and_publication_stays_held(self):
+        data = workflow('push-ee-build.yml')
+        jobs = data['jobs']
+        self.assertEqual(jobs['prepare-matrix']['if'].strip(),
+                         "github.ref == 'refs/heads/main' && "
+                         "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')")
+        for job in jobs.values():
+            for step in job.get('steps', []):
+                if step.get('uses', '').startswith('actions/checkout@'):
+                    self.assertEqual(step['with']['ref'], '${{ github.sha }}')
+        text = (ROOT / '.github/workflows/push-ee-build.yml').read_text()
+        self.assertNotIn('github.head_ref', text)
+        self.assertNotIn('github.base_ref', text)
+        self.assertNotIn('HEAD^1', text)
+        steps = jobs['build-ee']['steps']
+        verify = next(s for s in steps if s['name'] == 'Verify production source commit')
+        self.assertLess(steps.index(verify), next(i for i, s in enumerate(steps) if 'ci_secrets.py login' in s.get('run', '')))
+        self.assertEqual(verify['env']['SOURCE_COMMIT'], '${{ github.sha }}')
+        self.assertTrue(all(s['if'] == '${{ false }}' for j in jobs.values() for s in j.get('steps', [])
+                            if re.search(r'(?:ci_secrets\.py\s+push|ocp_ee\.py\s+publish)\b', s.get('run', ''))))
+
+    def test_production_push_uses_entire_event_range_and_rejects_invalid_bindings(self):
+        root, env, commits = self.production_fixture()
+        step = next(s for s in workflow('push-ee-build.yml')['jobs']['prepare-matrix']['steps']
+                    if s['name'] == 'Generate matrix (push)')
+        self.assertEqual(step['env'], {'BEFORE_COMMIT': '${{ github.event.before }}',
+                                      'AFTER_COMMIT': '${{ github.event.after }}',
+                                      'SOURCE_COMMIT': '${{ github.sha }}'})
+        cases = ((commits[0], commits[2], commits[2], True),
+                 ('0' * 40, commits[2], commits[2], False),
+                 ('not-a-commit', commits[2], commits[2], False),
+                 ('f' * 40, commits[2], commits[2], False),
+                 (commits[0], commits[1], commits[2], False),
+                 (commits[0], commits[1], commits[1], False),
+                 (commits[0], '0' * 40, '0' * 40, False))
+        output = root / 'matrix-argv.json'
+        for before, after, source, accepted in cases:
+            with self.subTest(before=before, after=after, source=source):
+                output.unlink(missing_ok=True)
+                inputs = dict(env, BEFORE_COMMIT=before, AFTER_COMMIT=after, SOURCE_COMMIT=source)
+                result = subprocess.run(['bash', '-e', '-c', step['run']], cwd=root, env=inputs,
+                                        capture_output=True, timeout=30, check=False)
+                self.assertEqual(result.returncode == 0, accepted)
+                self.assertEqual(output.exists(), accepted)
+                if accepted:
+                    self.assertEqual(json.loads(output.read_text()),
+                                     ['--start-ref', commits[0], '--end-ref', commits[2],
+                                      '--output-path', 'matrix_output.json'])
+
+    def test_production_worker_checks_actual_checkout_before_registry_access(self):
+        root, env, commits = self.production_fixture()
+        step = next(s for s in workflow('push-ee-build.yml')['jobs']['build-ee']['steps']
+                    if s['name'] == 'Verify production source commit')
+        for source, accepted in ((commits[2], True), (commits[1], False)):
+            with self.subTest(source=source):
+                result = subprocess.run(['bash', '-e', '-c', step['run']], cwd=root,
+                                        env=dict(env, SOURCE_COMMIT=source), capture_output=True,
+                                        timeout=30, check=False)
+                self.assertEqual(result.returncode == 0, accepted)
+
     def test_runner_context_is_absent_from_workflow_and_job_env(self):
         # GitHub resolves these mappings before assigning a runner. runner.temp
         # is allowed in step fields, but rejects the entire workflow here.

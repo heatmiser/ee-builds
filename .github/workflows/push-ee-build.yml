@@ -34,6 +34,9 @@ permissions:
 
 jobs:
   prepare-matrix:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -46,16 +49,30 @@ jobs:
       with:
         persist-credentials: false
         fetch-depth: 0
+        ref: ${{ github.sha }}
 
     - name: Generate matrix (push)
       id: generate-matrix
       if: github.event_name == 'push'
       working-directory: ${{ github.workspace }}
+      env:
+        BEFORE_COMMIT: ${{ github.event.before }}
+        AFTER_COMMIT: ${{ github.event.after }}
+        SOURCE_COMMIT: ${{ github.sha }}
       run: |
-        python -u .github/workflows/generate_matrix.py \
-        --start-ref $(git rev-parse HEAD^1) \
-        --end-ref $(git rev-parse HEAD) \
-        --output matrix_output.json
+        for COMMIT in "$BEFORE_COMMIT" "$SOURCE_COMMIT"; do
+          if [[ ! "$COMMIT" =~ ^[a-f0-9]{40}$ || "$COMMIT" = 0000000000000000000000000000000000000000 ]]; then
+            echo "Invalid production push range." >&2
+            exit 1
+          fi
+        done
+        test "$AFTER_COMMIT" = "$SOURCE_COMMIT"
+        test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+        git cat-file -e "$BEFORE_COMMIT^{commit}"
+        python3 -u .github/workflows/generate_matrix.py \
+          --start-ref "$BEFORE_COMMIT" \
+          --end-ref "$SOURCE_COMMIT" \
+          --output-path matrix_output.json
 
     - name: Generate matrix (workflow_dispatch)
       if: github.event_name == 'workflow_dispatch'
@@ -106,17 +123,18 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-          ref: ${{ github.head_ref }}
+          ref: ${{ github.sha }}
 
       - name: Validate EE project eligibility
         env:
           EE_PROJECT: ${{ matrix.ee }}
         run: python3 .github/scripts/ee_projects.py check --project "$EE_PROJECT"
 
-      - name: Fetch the base and head refs
+      - name: Verify production source commit
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
-          git fetch origin ${{ github.base_ref }}
-          git fetch origin ${{ github.head_ref }}
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
 
       - name: Install python requirements (ansible-builder)
         run: pip install -r requirements.txt
@@ -273,6 +291,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          ref: ${{ github.sha }}
 
       - name: Validate dependent EE eligibility
         env:

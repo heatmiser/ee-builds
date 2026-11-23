@@ -301,6 +301,133 @@ class SecretGuardTests(unittest.TestCase):
             self.assertFalse(any(argv[:2] == ["podman", "push"] for argv in runner.commands))
 
 
+class PublicationReceiptTests(unittest.TestCase):
+    identity = "sha256:" + "c" * 64
+    manifest = "sha256:" + "d" * 64
+    destination = "quay.io/public-team/dcm-base-ee:qualification"
+
+    def test_push_uses_inspected_identity_and_retains_checked_private_receipt(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            auth = root / "ee-auth-test.json"
+            env = {"RUNNER_TEMP": name, "REGISTRY_AUTH_FILE": str(auth), "CI_SECRET_AH_TOKEN": CANARY}
+            calls = []
+
+            def captured(argv, **kwargs):
+                calls.append((argv, kwargs))
+                Path(argv[argv.index("--digestfile") + 1]).write_text(self.manifest + "\n")
+                return b""
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, env, clear=True), \
+                    patch.object(guard, "inspect_image", return_value=self.identity) as inspect, \
+                    patch.object(guard, "captured", side_effect=captured), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                record = guard.push_image("mutable:tag", self.destination)
+            inspect.assert_called_once_with("mutable:tag")
+            receipts = list(root.glob("ee-publication-*/receipt.json"))
+            self.assertEqual(len(receipts), 1)
+            receipt = receipts[0]
+            self.assertEqual(record, {"schema_version": 1, "image_id": self.identity,
+                                      "destination": self.destination, "manifest_digest": self.manifest})
+            self.assertEqual(json.loads(receipt.read_text()), record)
+            self.assertEqual(receipt.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertEqual((receipt.parent / "manifest.digest").stat().st_mode & 0o777, 0o600)
+            self.assertEqual(calls, [(["podman", "push", "--authfile", str(auth), "--digestfile",
+                                      str(receipt.parent / "manifest.digest"), self.identity,
+                                      "docker://" + self.destination], {"capture_result": False})])
+            self.assertEqual(stdout.getvalue() + stderr.getvalue(), "")
+            self.assertNotIn(CANARY, receipt.read_text())
+
+    def test_missing_invalid_and_unsafe_digest_evidence_never_creates_receipt(self):
+        cases = (None, b"", b"not-a-digest", b"sha256:" + b"D" * 64, b"x" * 129, "symlink", "hardlink")
+        for payload in cases:
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+
+                def captured(argv, **kwargs):
+                    path = Path(argv[argv.index("--digestfile") + 1])
+                    if payload in ("symlink", "hardlink"):
+                        target = root / "target"
+                        target.write_text(self.manifest)
+                        if payload == "symlink": path.symlink_to(target)
+                        else: os.link(target, path)
+                    elif payload is not None:
+                        path.write_bytes(payload)
+                    return b""
+
+                with patch.dict(os.environ, {"RUNNER_TEMP": name,
+                                             "REGISTRY_AUTH_FILE": str(root / "ee-auth-test.json")}, clear=True), \
+                        patch.object(guard, "inspect_image", return_value=self.identity), \
+                        patch.object(guard, "captured", side_effect=captured):
+                    with self.assertRaises((ValueError, OSError)):
+                        guard.push_image("local:tag", self.destination)
+                self.assertEqual(list(root.glob("ee-publication-*/receipt.json")), [])
+
+    def test_failed_later_push_preserves_only_earlier_success_receipt(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+
+            def captured(argv, **kwargs):
+                Path(argv[argv.index("--digestfile") + 1]).write_text(self.manifest)
+                return b""
+
+            with patch.dict(os.environ, {"RUNNER_TEMP": name,
+                                         "REGISTRY_AUTH_FILE": str(root / "ee-auth-test.json")}, clear=True), \
+                    patch.object(guard, "inspect_image", return_value=self.identity), \
+                    patch.object(guard, "captured", side_effect=captured) as push:
+                guard.push_image("local:tag", self.destination)
+                earlier = next(root.glob("ee-publication-*/receipt.json"))
+                content = earlier.read_bytes()
+                push.side_effect = guard.GuardError("Protected command failed")
+                with self.assertRaises(guard.GuardError):
+                    guard.push_image("local:tag", self.destination + "-later")
+            self.assertEqual(list(root.glob("ee-publication-*/receipt.json")), [earlier])
+            self.assertEqual(earlier.read_bytes(), content)
+
+    def test_credential_matches_in_digest_or_receipt_prevent_success_receipt(self):
+        for secret in (self.manifest, "schema_version"):
+            with self.subTest(secret=secret), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+
+                def captured(argv, **kwargs):
+                    Path(argv[argv.index("--digestfile") + 1]).write_text(self.manifest)
+                    return b""
+
+                with patch.dict(os.environ, {"RUNNER_TEMP": name, "CI_SECRET_AH_TOKEN": secret,
+                                             "REGISTRY_AUTH_FILE": str(root / "ee-auth-test.json")}, clear=True), \
+                        patch.object(guard, "inspect_image", return_value=self.identity), \
+                        patch.object(guard, "captured", side_effect=captured):
+                    with self.assertRaises(guard.GuardError):
+                        guard.push_image("local:tag", self.destination)
+                self.assertEqual(list(root.glob("ee-publication-*/receipt.json")), [])
+
+    def test_invalid_destination_image_or_credential_match_prevents_push(self):
+        for destination, identity, secret in (("quay.io/team/image:tag;id", self.identity, CANARY),
+                                               (self.destination, "invalid", CANARY),
+                                               (self.destination, self.identity, "public-team")):
+            with self.subTest(destination=destination, identity=identity), tempfile.TemporaryDirectory() as name:
+                with patch.dict(os.environ, {"RUNNER_TEMP": name, "CI_SECRET_AH_TOKEN": secret,
+                                             "REGISTRY_AUTH_FILE": str(Path(name) / "ee-auth-test.json")}, clear=True), \
+                        patch.object(guard, "inspect_image", return_value=identity), \
+                        patch.object(guard, "captured") as push:
+                    with self.assertRaises(guard.GuardError): guard.push_image("local:tag", destination)
+                    push.assert_not_called()
+
+    def test_cli_push_failure_never_exposes_exception_or_receipt(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(sys, "argv", ["ci_secrets.py", "push", "--image", "local:tag",
+                                        "--destination", self.destination]), \
+                patch.dict(os.environ, {"CI_SECRET_AH_TOKEN": CANARY}, clear=True), \
+                patch.object(guard, "push_image", side_effect=OSError(CANARY)), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as caught: guard.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "ERROR: credential protection denied operation\n")
+
+
 class WorkflowGuardTests(unittest.TestCase):
     def test_every_upload_requires_its_exact_file_guard(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):

@@ -172,6 +172,47 @@ and review trigger paths, permissions, public artifacts and registry digest
 fidelity. The normal gate checks workflow credential values; broad upstream-content
 pattern scanning is outside that gate and is not reported as successful inspection.
 
+### Publication readiness and digest evidence
+
+Publication remains disabled. The production EE workflow accepts main-branch push
+and manual events, checks out the exact event commit, and verifies that identity
+before registry access in the primary build worker. Push selection compares the
+event's `before` commit with its `after` commit, including every commit in a
+multi-commit push. Missing commits, zero commit IDs and inconsistent event/checkout
+identities stop selection; the workflow does not guess a range from `HEAD^1`.
+
+The general EE `ci_secrets.py push` helper re-inspects the local image and pushes
+that immutable image ID using the job-owned authfile. A successful invocation
+retains this private runner evidence:
+
+| Path under `$RUNNER_TEMP/ee-publication-<unique>/` | Contents |
+|---|---|
+| `manifest.digest` | Bounded push-reported manifest digest; validated and checked for supplied credential values |
+| `receipt.json` | Schema version, inspected image ID, destination and manifest digest only; checked before writing |
+
+The directory is mode `0700`; successful digest evidence and receipts are mode
+`0600`. These files are outside every artifact upload path, and the helper prints
+neither command output nor receipt contents. Failed pushes, missing/invalid digest
+evidence or credential matches produce no success receipt for that invocation.
+Private evidence may remain after failure; earlier successful tag receipts remain.
+A push may already have reached the registry before a later check fails.
+
+A push-reported digest does **not** independently verify registry contents or
+establish that multiple tags share a manifest. Those checks remain qualification
+steps: resolve each published tag, compare its manifest digest, then pull by digest
+and verify image identity, runtime behavior and credential protection.
+
+| Next phase | Required evidence before proceeding |
+|---|---|
+| Explicit GHCR publication in `test` | Narrow package-write permission; selected canary publish, digest pull and image checks |
+| Production builds in `deploy` with publication held | Actual deploy credential transport, builds, runtime checks and output audit |
+| Explicit Quay publication | Immutable-tag checks before shared tags; registry digest and pulled-image verification |
+| Normal automatic publication | Qualified route, event selection, active/example enforcement and dependent-base handling |
+
+Deploy credentials and registry write access are separate from the successful
+test-environment builds and download audit. No publication, permission expansion,
+dependent-job enablement or registry operation follows from this readiness change.
+
 ## Plain-container builds
 
 ### Select a project
